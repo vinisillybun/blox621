@@ -125,6 +125,20 @@ app.post('/get-next-image', async (req, res) => {
 
     const processed = await pipeline.raw().toBuffer({ resolveWithObject: true });
 
+    const expectedBytes = processed.info.width * processed.info.height * 4;
+    const actualBytes = processed.data.length;
+    console.log(
+      `Sending ${processed.info.width}x${processed.info.height}, ` +
+      `${processed.info.channels} channels, ${actualBytes} bytes ` +
+      `(expected ${expectedBytes}) ${actualBytes === expectedBytes ? 'OK' : 'MISMATCH'}`
+    );
+
+    if (actualBytes !== expectedBytes) {
+      console.warn('Buffer size mismatch, skipping image:', post.id);
+      currentIndex++;
+      return res.json({ success: false, message: 'Pixel buffer size mismatch' });
+    }
+
     const pixelData = processed.data.toString('base64');
 
     currentIndex++;
