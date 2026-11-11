@@ -12,9 +12,11 @@ app.use(express.json());
 let cachedPosts = [];
 let currentIndex = 0;
 
+const MAX_DIMENSION = 1024;
+
 app.post('/fetch-posts', async (req, res) => {
   const { tags = 'rating:safe', page = 1, limit = 30 } = req.body;
-  
+
   const maxLimit = 320;
   const validLimit = Math.min(Math.max(parseInt(limit) || 30, 1), maxLimit);
 
@@ -48,14 +50,13 @@ app.post('/autocomplete-tags', async (req, res) => {
   }
 
   try {
-    // Clean the query - remove special characters that might cause issues
     const cleanQuery = query.trim().replace(/[^\w\s-_]/g, '');
-    
+
     const url = `https://e621.net/tags/autocomplete.json?search[name_matches]=${encodeURIComponent(cleanQuery)}*`;
     const headers = { 'User-Agent': 'RobloxGame/1.0 (by your_email@example.com)' };
 
     console.log('Autocomplete request for:', cleanQuery);
-    
+
     const response = await axios.get(url, { headers });
     const tags = response.data || [];
 
@@ -75,13 +76,12 @@ app.post('/autocomplete-tags', async (req, res) => {
 });
 
 app.post('/get-next-image', async (req, res) => {
-  // Skip videos/gifs and find the next valid image
   while (currentIndex < cachedPosts.length) {
     const post = cachedPosts[currentIndex];
     const fileUrl = post.file?.url;
 
     if (fileUrl && !/\.(mp4|webm|gif)$/i.test(fileUrl)) {
-      break; // Found a valid image
+      break;
     }
     currentIndex++;
   }
@@ -102,35 +102,40 @@ app.post('/get-next-image', async (req, res) => {
     const imageResponse = await axios.get(fileUrl, { responseType: 'arraybuffer' });
     const imageBuffer = Buffer.from(imageResponse.data);
 
-    // Get original image metadata
     const metadata = await sharp(imageBuffer).metadata();
     const originalWidth = metadata.width;
     const originalHeight = metadata.height;
 
-    // Resize to 512x512 with optimizations for Roblox
-    const resizedBuffer = await sharp(imageBuffer)
-      .resize(512, 512, {
-        fit: 'contain',
-        background: { r: 0, g: 0, b: 0, alpha: 0 }
-      })
-      .ensureAlpha()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
+    if (!originalWidth || !originalHeight) {
+      currentIndex++;
+      return res.json({ success: false, message: 'Could not read image dimensions' });
+    }
 
-    // Convert to base64 in smaller chunks to avoid memory issues
-    const pixelData = resizedBuffer.data.toString('base64');
+    const longestSide = Math.max(originalWidth, originalHeight);
+    const needsResize = longestSide > MAX_DIMENSION;
+
+    let pipeline = sharp(imageBuffer).ensureAlpha();
+
+    if (needsResize) {
+      const scale = MAX_DIMENSION / longestSide;
+      const targetWidth = Math.round(originalWidth * scale);
+      const targetHeight = Math.round(originalHeight * scale);
+      pipeline = pipeline.resize(targetWidth, targetHeight, { fit: 'fill' });
+    }
+
+    const processed = await pipeline.raw().toBuffer({ resolveWithObject: true });
+
+    const pixelData = processed.data.toString('base64');
 
     currentIndex++;
 
     res.json({
       success: true,
       pixelData,
-      width: resizedBuffer.info.width,
-      height: resizedBuffer.info.height,
-      originalWidth: originalWidth,
-      originalHeight: originalHeight,
-      sampleWidth: post.sample?.width || originalWidth,
-      sampleHeight: post.sample?.height || originalHeight,
+      width: processed.info.width,
+      height: processed.info.height,
+      originalWidth,
+      originalHeight,
       rating: post.rating,
       postId: post.id,
       score: post.score?.total || 0,
