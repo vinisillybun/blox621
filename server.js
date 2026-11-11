@@ -501,9 +501,9 @@ app.post("/post-count", async (req, res) => {
   }
 
   try {
-    const data = await e621Get("/counts/posts.json", { tags });
-    const raw = data && data.counts ? data.counts.posts : data && data.posts;
-    const total = Number(raw);
+   const data = await e621Get("/posts/count.json", { tags });
+   const raw = data && data.count !== undefined ? data.count : data && data.counts && data.counts.posts;
+   const total = Number(raw);
     if (!Number.isFinite(total) || total < 0) {
       return res.json({ success: false, message: "Unexpected count response" });
     }
