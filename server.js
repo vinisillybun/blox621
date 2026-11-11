@@ -647,6 +647,42 @@ async function buildThumb(p) {
 }
 
 /**
+ * Posts for the "From the Artist" panel, the way the e621 website does it:
+ * ids come from e621's own recommender (/posts/:id/similar/artist.json), then the
+ * posts are loaded with tags=id:1,2,3 and kept in the recommender's order, skipping
+ * deleted ones. If that endpoint fails or returns nothing, fall back to a plain
+ * artist-tag search (newest first).
+ */
+async function similarArtistPosts(postId, limit, ratingTokens, artist) {
+  try {
+    const sim = await e621Get(`/posts/${postId}/similar/artist.json`, { limit });
+    const ids = (Array.isArray(sim && sim.results) ? sim.results : [])
+      .map((r) => r.post_id)
+      .filter(Number.isInteger);
+
+    if (ids.length) {
+      const data = await e621Get("/posts.json", {
+        tags: ["id:" + ids.join(","), ...ratingTokens].join(" "),
+        limit: ids.length,
+      });
+      const byId = new Map((Array.isArray(data.posts) ? data.posts : []).map((p) => [p.id, p]));
+      const ordered = ids
+        .map((id) => byId.get(id))
+        .filter((p) => p && !(p.flags && p.flags.deleted)); // keep e621's order, skip deleted
+      if (ordered.length) return ordered;
+    }
+  } catch (err) {
+    console.warn("similar/artist failed, falling back to tag search:", err.message);
+  }
+
+  const data = await e621Get("/posts.json", {
+    tags: [artist, ...ratingTokens].join(" "),
+    limit: limit + 1,
+  });
+  return Array.isArray(data.posts) ? data.posts : [];
+}
+
+/**
  * Other posts by the open post's artist.
  * Body: { sessionId, postId, limit? }
  * Keeps any rating: filters from the player's own search so the panel never
@@ -679,15 +715,15 @@ app.post("/artist-posts", async (req, res) => {
   const query = [artist, ...ratingTokens].join(" ");
 
   try {
-    const cacheKey = `${query}|${cleanLimit}`;
+    // results depend on the open post (recommender), so the post id is part of the key
+    const cacheKey = `${post.id}|${query}|${cleanLimit}`;
     let list;
     const hit = artistCache.get(cacheKey);
     if (hit && Date.now() - hit.at < ARTIST_TTL_MS) {
       list = hit.posts;
     } else {
       // ask for one extra so we can drop the post that is currently open
-      const data = await e621Get("/posts.json", { tags: query, limit: cleanLimit + 1 });
-      const raw = Array.isArray(data.posts) ? data.posts : [];
+      const raw = await similarArtistPosts(post.id, cleanLimit + 1, ratingTokens, artist);
       const built = await Promise.all(
         raw.map(async (p) => {
           const slim = slimPost(p);
