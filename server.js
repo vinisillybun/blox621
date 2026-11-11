@@ -480,6 +480,43 @@ app.post("/fetch-posts", async (req, res) => {
 });
 
 /**
+ * Body: { sessionId }
+ * Total number of posts matching the session's current search, so the client can show page numbers.
+ * Uses e621's /counts/posts.json; if that fails the client simply shows prev/next without a last page.
+ */
+const COUNT_TTL_MS = 5 * 60 * 1000;
+const COUNT_CACHE_MAX = 100;
+const countCache = new Map(); // tags -> { at, total }
+
+app.post("/post-count", async (req, res) => {
+  const { sessionId } = req.body || {};
+  if (!validSessionId(sessionId)) {
+    return res.json({ success: false, message: "sessionId required" });
+  }
+  const tags = getSession(sessionId).tags || "rating:safe";
+
+  const hit = countCache.get(tags);
+  if (hit && Date.now() - hit.at < COUNT_TTL_MS) {
+    return res.json({ success: true, total: hit.total });
+  }
+
+  try {
+    const data = await e621Get("/counts/posts.json", { tags });
+    const raw = data && data.counts ? data.counts.posts : data && data.posts;
+    const total = Number(raw);
+    if (!Number.isFinite(total) || total < 0) {
+      return res.json({ success: false, message: "Unexpected count response" });
+    }
+    if (countCache.size >= COUNT_CACHE_MAX) countCache.delete(countCache.keys().next().value);
+    countCache.set(tags, { at: Date.now(), total });
+    res.json({ success: true, total });
+  } catch (err) {
+    console.error("post-count failed:", err.message);
+    res.json({ success: false, message: "Failed to count posts" });
+  }
+});
+
+/**
  * Body: { sessionId, start, count }
  * Returns grid thumbnails for session.posts[start .. start+count-1].
  */
