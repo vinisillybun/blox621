@@ -10,15 +10,13 @@ app.use(bodyParser.json({ limit: "10mb" }));
 app.use(express.json());
 
 // --- e621 config -----------------------------------------------------------
-// A descriptive User-Agent with REAL contact info is required by e621.
-// Default library UAs and browser impersonation get blocked (403).
 const USER_AGENT = "Blox621/1.0 (Roblox experience; contact: your_email@example.com)";
 const E621_BASE = "https://e621.net";
 const MAX_EDITABLE_DIMENSION = 1024; // Roblox EditableImage limit
 const DEFAULT_LIMIT = 30;
 const MAX_LIMIT = 320;
 
-// e621 hard limit is 2 req/s; they ask for <= 1 req/s sustained.
+const SAMPLE_MAX_DIMENSION = 850; // "longest side capped at 850"
 const MIN_REQUEST_INTERVAL_MS = 1000;
 let lastRequestAt = 0;
 
@@ -32,7 +30,7 @@ async function e621Get(path, params = {}) {
     params,
     headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
     timeout: 15000,
-    validateStatus: () => true, // handle codes ourselves
+    validateStatus: () => true,
   });
 
   if (res.status === 429 || res.status === 503) {
@@ -53,37 +51,98 @@ async function e621Get(path, params = {}) {
   return res.data;
 }
 
-// --- in-memory state -------------------------------------------------------
-// The Roblox client never sends a postId, so the server hands out posts in
-// order from the last search: /fetch-posts primes this, /get-next-image drains it.
-let cachedPosts = [];
-let cursor = 0;
-let imageCache = {}; // postId+mode -> response payload
+// --- per-session in-memory state -------------------------------------------
+// Previously this was global, which meant two simultaneous players would
+// clobber each other's cachedPosts and cursor, causing the first player's
+// batch loop to drain the wrong (or empty) list.
+const SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-function resetCache() {
-  cachedPosts = [];
-  cursor = 0;
-  imageCache = {};
+/** @type {Map<string, {posts: any[], cursor: number, imageCache: Record<string, any>, lastUsed: number}>} */
+const sessions = new Map();
+
+function getSession(sessionId) {
+  let s = sessions.get(sessionId);
+  if (!s) {
+    s = { posts: [], cursor: 0, imageCache: {}, lastUsed: Date.now() };
+    sessions.set(sessionId, s);
+  }
+  s.lastUsed = Date.now();
+  return s;
+}
+
+// Periodic sweep so old sessions don't leak memory.
+setInterval(() => {
+  const cutoff = Date.now() - SESSION_TTL_MS;
+  for (const [id, s] of sessions) {
+    if (s.lastUsed < cutoff) sessions.delete(id);
+  }
+}, 60 * 1000).unref?.();
+
+// --- helpers ---------------------------------------------------------------
+
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp)(\?|$)/i;
+
+function isSupportedUrl(url) {
+  return typeof url === "string" && IMAGE_EXT_RE.test(url);
+}
+
+function sniffImageType(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "png";
+  if (buf[0] === 0xff && buf[1] === 0xd8) return "jpeg";
+  if (buf.toString("ascii", 0, 3) === "GIF") return "gif";
+  if (
+    buf.toString("ascii", 0, 4) === "RIFF" &&
+    buf.toString("ascii", 8, 12) === "WEBP"
+  )
+    return "webp";
+  return null;
+}
+
+/**
+ * Compute the target (width, height) for the given mode, honoring:
+ *  - "sample" mode: longest side capped at SAMPLE_MAX_DIMENSION
+ *  - always:        longest side capped at MAX_EDITABLE_DIMENSION
+ * Uses the longest side (not just width) so portrait images behave correctly.
+ */
+function computeTargetSize(originalWidth, originalHeight, mode) {
+  let scale = 1;
+  const longest = Math.max(originalWidth, originalHeight);
+
+  if (mode === "sample" && longest > SAMPLE_MAX_DIMENSION) {
+    scale = SAMPLE_MAX_DIMENSION / longest;
+  }
+
+  let targetWidth = Math.max(1, Math.round(originalWidth * scale));
+  let targetHeight = Math.max(1, Math.round(originalHeight * scale));
+
+  const largestTarget = Math.max(targetWidth, targetHeight);
+  if (largestTarget > MAX_EDITABLE_DIMENSION) {
+    const capScale = MAX_EDITABLE_DIMENSION / largestTarget;
+    targetWidth = Math.max(1, Math.round(targetWidth * capScale));
+    targetHeight = Math.max(1, Math.round(targetHeight * capScale));
+  }
+
+  return { targetWidth, targetHeight };
 }
 
 // --- routes ----------------------------------------------------------------
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "Blox621", posts: cachedPosts.length });
+  res.json({ ok: true, service: "Blox621", sessions: sessions.size });
 });
 
-/**
- * Search posts. Body: { tags?: string|string[], page?: number, limit?: number }
- * Response shape the Roblox script expects: { success, count, posts }
- */
 app.post("/fetch-posts", async (req, res) => {
-  const { tags = "", page = 1, limit = DEFAULT_LIMIT } = req.body || {};
+  const { tags = "", page = 1, limit = DEFAULT_LIMIT, sessionId } = req.body || {};
+
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    return res.status(400).json({ success: false, error: "sessionId required", count: 0 });
+  }
 
   const tagString = Array.isArray(tags) ? tags.join(" ") : String(tags || "");
   const cleanLimit = Math.min(Math.max(parseInt(limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
   const cleanPage = Math.max(parseInt(page, 10) || 1, 1);
 
-  // Always default to safe content unless the caller asked otherwise.
   const finalTags = tagString.trim().length > 0 ? tagString : "rating:safe";
 
   try {
@@ -94,24 +153,29 @@ app.post("/fetch-posts", async (req, res) => {
     });
 
     const posts = Array.isArray(data.posts) ? data.posts : [];
-    resetCache();
-    cachedPosts = posts;
 
-    if (posts.length === 0) {
-      return res.json({ success: true, count: 0, posts: [] });
-    }
+    // Only keep posts with a static-image URL we can actually process.
+    const slim = posts
+      .map((p) => {
+        const sampleUrl = p.sample && p.sample.url ? p.sample.url : null;
+        const fileUrl = p.file && p.file.url ? p.file.url : null;
+        return {
+          id: p.id,
+          sampleUrl,
+          fileUrl,
+          width: p.file ? p.file.width : null,
+          height: p.file ? p.file.height : null,
+          sampleWidth: p.sample ? p.sample.width : null,
+          sampleHeight: p.sample ? p.sample.height : null,
+          rating: p.rating,
+        };
+      })
+      .filter((p) => isSupportedUrl(p.sampleUrl) || isSupportedUrl(p.fileUrl));
 
-    // Only send the client what it needs: id and the URLs it may request.
-    const slim = posts.map((p) => ({
-      id: p.id,
-      sampleUrl: p.sample && p.sample.url ? p.sample.url : null,
-      fileUrl: p.file && p.file.url ? p.file.url : null,
-      width: p.file ? p.file.width : null,
-      height: p.file ? p.file.height : null,
-      sampleWidth: p.sample ? p.sample.width : null,
-      sampleHeight: p.sample ? p.sample.height : null,
-      rating: p.rating,
-    }));
+    const session = getSession(sessionId);
+    session.posts = slim;
+    session.cursor = 0;
+    session.imageCache = {};
 
     res.json({ success: true, count: slim.length, posts: slim });
   } catch (err) {
@@ -121,31 +185,31 @@ app.post("/fetch-posts", async (req, res) => {
   }
 });
 
-/**
- * Hand out the next image in the cached post list.
- * Body: { mode?: "sample" | "original" }  -- matches the Roblox client.
- * Response: { success, pixelData, width, height, originalWidth, originalHeight, postId, mode }
- */
 app.post("/get-next-image", async (req, res) => {
-  const { mode = "sample" } = req.body || {};
+  const { mode = "sample", sessionId } = req.body || {};
 
-  if (cachedPosts.length === 0) {
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    return res.json({ success: false, message: "sessionId required" });
+  }
+
+  const session = getSession(sessionId);
+
+  if (session.posts.length === 0) {
     return res.json({ success: false, message: "No posts cached. Call /fetch-posts first." });
   }
-  if (cursor >= cachedPosts.length) {
+  if (session.cursor >= session.posts.length) {
     return res.json({ success: false, message: "No more images in this batch." });
   }
 
-  const post = cachedPosts[cursor];
-  cursor += 1;
+  const post = session.posts[session.cursor];
+  session.cursor += 1;
 
   const cacheKey = `${post.id}:${mode}`;
-  if (imageCache[cacheKey]) {
-    return res.json({ success: true, ...imageCache[cacheKey] });
+  if (session.imageCache[cacheKey]) {
+    return res.json({ success: true, ...session.imageCache[cacheKey] });
   }
 
-  const fileUrl =
-    mode === "original" ? post.fileUrl : post.sampleUrl || post.fileUrl;
+  const fileUrl = mode === "original" ? post.fileUrl : post.sampleUrl || post.fileUrl;
   if (!fileUrl) {
     return res.json({ success: false, message: "No file URL available" });
   }
@@ -159,7 +223,17 @@ app.post("/get-next-image", async (req, res) => {
     });
     const imageBuffer = Buffer.from(imgRes.data);
 
-    // Read the REAL dimensions of the bytes we just downloaded.
+    // Guard: e621 sometimes returns HTML error pages or non-static formats
+    // (e.g. .webm) even when the URL looked like an image.
+    const sniffed = sniffImageType(imageBuffer);
+    if (!sniffed) {
+      return res.json({
+        success: false,
+        message: "Downloaded payload is not a supported image",
+        postId: post.id,
+      });
+    }
+
     const metadata = await sharp(imageBuffer).metadata();
     const originalWidth = metadata.width;
     const originalHeight = metadata.height;
@@ -167,24 +241,14 @@ app.post("/get-next-image", async (req, res) => {
       return res.json({ success: false, message: "Could not read image dimensions" });
     }
 
-    // Work out a target size that respects BOTH the 850px sample cap and the
-    // 1024px EditableImage cap, scaled proportionally.
-    let scale = 1;
-    if (mode === "sample" && originalWidth > 850) {
-      scale = 850 / originalWidth;
-    }
-    let targetWidth = Math.round(originalWidth * scale);
-    let targetHeight = Math.round(originalHeight * scale);
+    const { targetWidth, targetHeight } = computeTargetSize(
+      originalWidth,
+      originalHeight,
+      mode
+    );
 
-    const largest = Math.max(targetWidth, targetHeight);
-    if (largest > MAX_EDITABLE_DIMENSION) {
-      const capScale = MAX_EDITABLE_DIMENSION / largest;
-      targetWidth = Math.round(targetWidth * capScale);
-      targetHeight = Math.round(targetHeight * capScale);
-    }
-
-    // .raw() with ensureAlpha() gives RGBA — exactly 4 bytes per pixel.
-    const processed = await sharp(imageBuffer)
+    // sharp: for animated GIFs/WebPs, take the first frame only.
+    const processed = await sharp(imageBuffer, { animated: false })
       .ensureAlpha()
       .resize(targetWidth, targetHeight, { fit: "fill" })
       .raw()
@@ -192,7 +256,10 @@ app.post("/get-next-image", async (req, res) => {
 
     const { data, info } = processed;
     if (info.channels !== 4) {
-      return res.json({ success: false, message: `Expected 4 channels, got ${info.channels}` });
+      return res.json({
+        success: false,
+        message: `Expected 4 channels, got ${info.channels}`,
+      });
     }
 
     const expectedBytes = info.width * info.height * 4;
@@ -214,24 +281,34 @@ app.post("/get-next-image", async (req, res) => {
       mode,
     };
 
-    imageCache[cacheKey] = payload;
+    session.imageCache[cacheKey] = payload;
     res.json(payload);
   } catch (err) {
-    console.error("get-next-image failed:", err.message);
+    console.error("get-next-image failed:", err.message, "url:", fileUrl);
     res.json({ success: false, message: "Failed to process image" });
   }
 });
 
 /** Kept for compatibility with anything that names a post explicitly. */
 app.post("/get-image", async (req, res) => {
-  const { postId, mode = "sample" } = req.body || {};
-  const index = cachedPosts.findIndex((p) => String(p.id) === String(postId));
+  const { postId, mode = "sample", sessionId } = req.body || {};
+
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    return res.json({ success: false, message: "sessionId required" });
+  }
+
+  const session = getSession(sessionId);
+  const index = session.posts.findIndex((p) => String(p.id) === String(postId));
   if (index === -1) {
     return res.json({ success: false, message: "Post not found in cache" });
   }
-  cursor = index; // let /get-next-image pick it up
+  session.cursor = index;
   return app._router.handle(
-    Object.assign(req, { url: "/get-next-image", body: { mode }, method: "POST" }),
+    Object.assign(req, {
+      url: "/get-next-image",
+      body: { mode, sessionId },
+      method: "POST",
+    }),
     res,
     () => res.json({ success: false, message: "Internal redirect failed" })
   );
