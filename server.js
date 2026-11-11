@@ -1,76 +1,87 @@
 const express = require("express");
 const axios = require("axios");
 const sharp = require("sharp");
-const bodyParser = require("body-parser");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(bodyParser.json({ limit: "10mb" }));
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
+sharp.cache(false); // don't keep decoded originals in sharp's internal cache
 
 // --- e621 config -----------------------------------------------------------
 const USER_AGENT = "Blox621/1.0 (Roblox experience; contact: your_email@example.com)";
 const E621_BASE = "https://e621.net";
-const MAX_EDITABLE_DIMENSION = 1024; // Roblox EditableImage limit
+const MAX_EDITABLE_DIMENSION = 1024; // Roblox EditableImage limit (also caps "original")
 const DEFAULT_LIMIT = 30;
 const MAX_LIMIT = 320;
 
 const SAMPLE_MAX_DIMENSION = 850; // "longest side capped at 850"
 const MIN_REQUEST_INTERVAL_MS = 1000;
+
+const TAG_CATEGORIES = ["artist", "copyright", "character", "species", "general", "meta", "lore"];
+const VALID_MODES = new Set(["sample", "original"]);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// --- e621 request queue ----------------------------------------------------
+// Every e621 API call goes through one promise chain so concurrent requests are
+// spaced MIN_REQUEST_INTERVAL_MS apart (the old version let two callers both
+// see "no wait needed" and fire together).
 let lastRequestAt = 0;
+let queue = Promise.resolve();
 
-async function e621Get(path, params = {}) {
-  const now = Date.now();
-  const wait = MIN_REQUEST_INTERVAL_MS - (now - lastRequestAt);
-  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-  lastRequestAt = Date.now();
+function e621Get(path, params = {}) {
+  const run = async () => {
+    const wait = MIN_REQUEST_INTERVAL_MS - (Date.now() - lastRequestAt);
+    if (wait > 0) await sleep(wait);
+    lastRequestAt = Date.now();
 
-  const res = await axios.get(E621_BASE + path, {
-    params,
-    headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-    timeout: 15000,
-    validateStatus: () => true,
-  });
+    const res = await axios.get(E621_BASE + path, {
+      params,
+      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+      timeout: 15000,
+      validateStatus: () => true,
+    });
 
-  if (res.status === 429 || res.status === 503) {
-    const err = new Error("Rate limited by e621");
-    err.status = 429;
-    throw err;
-  }
-  if (res.status === 403) {
-    const err = new Error("Forbidden by e621 (check User-Agent)");
-    err.status = 403;
-    throw err;
-  }
-  if (res.status < 200 || res.status >= 300) {
-    const err = new Error(`e621 returned ${res.status}`);
-    err.status = res.status;
-    throw err;
-  }
-  return res.data;
+    if (res.status === 429 || res.status === 503) {
+      const err = new Error("Rate limited by e621");
+      err.status = 429;
+      throw err;
+    }
+    if (res.status === 403) {
+      const err = new Error("Forbidden by e621 (check User-Agent)");
+      err.status = 403;
+      throw err;
+    }
+    if (res.status < 200 || res.status >= 300) {
+      const err = new Error(`e621 returned ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return res.data;
+  };
+
+  const p = queue.then(run, run);
+  queue = p.catch(() => {});
+  return p;
 }
 
 // --- per-session in-memory state -------------------------------------------
-// Previously this was global, which meant two simultaneous players would
-// clobber each other's cachedPosts and cursor, causing the first player's
-// batch loop to drain the wrong (or empty) list.
 const SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-/** @type {Map<string, {posts: any[], cursor: number, imageCache: Record<string, any>, lastUsed: number}>} */
+/** @type {Map<string, {posts: any[], cursor: number, lastUsed: number}>} */
 const sessions = new Map();
 
 function getSession(sessionId) {
   let s = sessions.get(sessionId);
   if (!s) {
-    s = { posts: [], cursor: 0, imageCache: {}, lastUsed: Date.now() };
+    s = { posts: [], cursor: 0, lastUsed: Date.now() };
     sessions.set(sessionId, s);
   }
   s.lastUsed = Date.now();
   return s;
 }
 
-// Periodic sweep so old sessions don't leak memory.
 setInterval(() => {
   const cutoff = Date.now() - SESSION_TTL_MS;
   for (const [id, s] of sessions) {
@@ -86,24 +97,25 @@ function isSupportedUrl(url) {
   return typeof url === "string" && IMAGE_EXT_RE.test(url);
 }
 
+function validSessionId(id) {
+  return typeof id === "string" && id.length > 0 && id.length <= 100;
+}
+
 function sniffImageType(buf) {
   if (!buf || buf.length < 12) return null;
   if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "png";
   if (buf[0] === 0xff && buf[1] === 0xd8) return "jpeg";
   if (buf.toString("ascii", 0, 3) === "GIF") return "gif";
-  if (
-    buf.toString("ascii", 0, 4) === "RIFF" &&
-    buf.toString("ascii", 8, 12) === "WEBP"
-  )
+  if (buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP")
     return "webp";
   return null;
 }
 
 /**
- * Compute the target (width, height) for the given mode, honoring:
- *  - "sample" mode: longest side capped at SAMPLE_MAX_DIMENSION
- *  - always:        longest side capped at MAX_EDITABLE_DIMENSION
- * Uses the longest side (not just width) so portrait images behave correctly.
+ * Target (width, height) for a mode:
+ *  - "sample":   longest side capped at SAMPLE_MAX_DIMENSION
+ *  - "original": full size, but always capped at MAX_EDITABLE_DIMENSION
+ * Uses the longest side so portrait images behave correctly.
  */
 function computeTargetSize(originalWidth, originalHeight, mode) {
   let scale = 1;
@@ -126,6 +138,96 @@ function computeTargetSize(originalWidth, originalHeight, mode) {
   return { targetWidth, targetHeight };
 }
 
+/** Small, JSON-safe slice of an e621 post that the Roblox UI shows in its sidebar. */
+function buildMeta(p) {
+  const tags = {};
+  for (const c of TAG_CATEGORIES) {
+    tags[c] = Array.isArray(p.tags && p.tags[c]) ? p.tags[c] : [];
+  }
+  const flags = p.flags || {};
+  const created = p.created_at ? Date.parse(p.created_at) : NaN;
+  return {
+    tags,
+    rating: p.rating || "s",
+    score: p.score && typeof p.score.total === "number" ? p.score.total : 0,
+    favCount: p.fav_count || 0,
+    ext: (p.file && p.file.ext) || "",
+    fileSize: (p.file && p.file.size) || 0,
+    createdAt: Number.isNaN(created) ? 0 : Math.floor(created / 1000), // unix seconds
+    description: String(p.description || "").slice(0, 600),
+    status: flags.deleted ? "Deleted" : flags.pending ? "Pending" : flags.flagged ? "Flagged" : "Active",
+    commentCount: p.comment_count || 0,
+  };
+}
+
+/**
+ * Download one post's image and return the Roblox payload (raw RGBA as base64).
+ * mode "original" falls back to the sample if the original isn't a static image.
+ * Nothing is cached here: RGBA payloads are several MB each.
+ */
+async function buildPayload(post, mode) {
+  const wantOriginal = mode === "original" && isSupportedUrl(post.fileUrl);
+  const fileUrl = wantOriginal
+    ? post.fileUrl
+    : isSupportedUrl(post.sampleUrl)
+    ? post.sampleUrl
+    : post.fileUrl;
+  const usedMode = wantOriginal ? "original" : "sample";
+
+  if (!fileUrl) {
+    return { success: false, message: "No file URL available", postId: post.id };
+  }
+
+  const imgRes = await axios.get(fileUrl, {
+    responseType: "arraybuffer",
+    headers: { "User-Agent": USER_AGENT },
+    timeout: 30000,
+    maxContentLength: 32 * 1024 * 1024,
+  });
+  const imageBuffer = Buffer.from(imgRes.data);
+
+  // e621 sometimes returns HTML error pages or non-static formats.
+  if (!sniffImageType(imageBuffer)) {
+    return { success: false, message: "Downloaded payload is not a supported image", postId: post.id };
+  }
+
+  const metadata = await sharp(imageBuffer).metadata();
+  const originalWidth = post.width || metadata.width;
+  const originalHeight = post.height || metadata.height;
+  if (!metadata.width || !metadata.height) {
+    return { success: false, message: "Could not read image dimensions", postId: post.id };
+  }
+
+  // Resize from the dimensions of the file we actually downloaded.
+  const { targetWidth, targetHeight } = computeTargetSize(metadata.width, metadata.height, usedMode);
+
+  // For animated GIFs/WebPs, take the first frame only.
+  const { data, info } = await sharp(imageBuffer, { animated: false })
+    .ensureAlpha()
+    .resize(targetWidth, targetHeight, { fit: "fill" })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  if (info.channels !== 4) {
+    return { success: false, message: `Expected 4 channels, got ${info.channels}`, postId: post.id };
+  }
+  if (data.length !== info.width * info.height * 4) {
+    return { success: false, message: "Buffer size mismatch", postId: post.id };
+  }
+
+  return {
+    success: true,
+    pixelData: data.toString("base64"),
+    width: info.width,
+    height: info.height,
+    originalWidth, // true size of the e621 original, even if the texture is capped
+    originalHeight,
+    postId: post.id,
+    mode: usedMode,
+    meta: post.meta,
+  };
+}
+
 // --- routes ----------------------------------------------------------------
 
 app.get("/", (req, res) => {
@@ -135,14 +237,13 @@ app.get("/", (req, res) => {
 app.post("/fetch-posts", async (req, res) => {
   const { tags = "", page = 1, limit = DEFAULT_LIMIT, sessionId } = req.body || {};
 
-  if (typeof sessionId !== "string" || sessionId.length === 0) {
+  if (!validSessionId(sessionId)) {
     return res.status(400).json({ success: false, error: "sessionId required", count: 0 });
   }
 
   const tagString = Array.isArray(tags) ? tags.join(" ") : String(tags || "");
   const cleanLimit = Math.min(Math.max(parseInt(limit, 10) || DEFAULT_LIMIT, 1), MAX_LIMIT);
   const cleanPage = Math.max(parseInt(page, 10) || 1, 1);
-
   const finalTags = tagString.trim().length > 0 ? tagString : "rating:safe";
 
   try {
@@ -154,46 +255,42 @@ app.post("/fetch-posts", async (req, res) => {
 
     const posts = Array.isArray(data.posts) ? data.posts : [];
 
-    // Only keep posts with a static-image URL we can actually process.
     const slim = posts
-      .map((p) => {
-        const sampleUrl = p.sample && p.sample.url ? p.sample.url : null;
-        const fileUrl = p.file && p.file.url ? p.file.url : null;
-        return {
-          id: p.id,
-          sampleUrl,
-          fileUrl,
-          width: p.file ? p.file.width : null,
-          height: p.file ? p.file.height : null,
-          sampleWidth: p.sample ? p.sample.width : null,
-          sampleHeight: p.sample ? p.sample.height : null,
-          rating: p.rating,
-        };
-      })
+      .map((p) => ({
+        id: p.id,
+        sampleUrl: p.sample && p.sample.url ? p.sample.url : null,
+        fileUrl: p.file && p.file.url ? p.file.url : null,
+        width: p.file ? p.file.width : null,
+        height: p.file ? p.file.height : null,
+        rating: p.rating,
+        meta: buildMeta(p),
+      }))
       .filter((p) => isSupportedUrl(p.sampleUrl) || isSupportedUrl(p.fileUrl));
 
     const session = getSession(sessionId);
     session.posts = slim;
     session.cursor = 0;
-    session.imageCache = {};
 
-    res.json({ success: true, count: slim.length, posts: slim });
+    res.json({
+      success: true,
+      count: slim.length,
+      posts: slim.map((p) => ({ id: p.id, rating: p.rating })),
+    });
   } catch (err) {
     console.error("fetch-posts failed:", err.message);
-    const status = err.status === 429 ? 429 : 500;
-    res.status(status).json({ success: false, error: err.message, count: 0 });
+    res.status(err.status === 429 ? 429 : 500).json({ success: false, error: err.message, count: 0 });
   }
 });
 
 app.post("/get-next-image", async (req, res) => {
   const { mode = "sample", sessionId } = req.body || {};
 
-  if (typeof sessionId !== "string" || sessionId.length === 0) {
+  if (!validSessionId(sessionId)) {
     return res.json({ success: false, message: "sessionId required" });
   }
+  const cleanMode = VALID_MODES.has(mode) ? mode : "sample";
 
   const session = getSession(sessionId);
-
   if (session.posts.length === 0) {
     return res.json({ success: false, message: "No posts cached. Call /fetch-posts first." });
   }
@@ -204,125 +301,64 @@ app.post("/get-next-image", async (req, res) => {
   const post = session.posts[session.cursor];
   session.cursor += 1;
 
-  const cacheKey = `${post.id}:${mode}`;
-  if (session.imageCache[cacheKey]) {
-    return res.json({ success: true, ...session.imageCache[cacheKey] });
-  }
-
-  const fileUrl = mode === "original" ? post.fileUrl : post.sampleUrl || post.fileUrl;
-  if (!fileUrl) {
-    return res.json({ success: false, message: "No file URL available" });
-  }
-
   try {
-    const imgRes = await axios.get(fileUrl, {
-      responseType: "arraybuffer",
-      headers: { "User-Agent": USER_AGENT },
-      timeout: 20000,
-      maxContentLength: 32 * 1024 * 1024,
-    });
-    const imageBuffer = Buffer.from(imgRes.data);
-
-    // Guard: e621 sometimes returns HTML error pages or non-static formats
-    // (e.g. .webm) even when the URL looked like an image.
-    const sniffed = sniffImageType(imageBuffer);
-    if (!sniffed) {
-      return res.json({
-        success: false,
-        message: "Downloaded payload is not a supported image",
-        postId: post.id,
-      });
-    }
-
-    const metadata = await sharp(imageBuffer).metadata();
-    const originalWidth = metadata.width;
-    const originalHeight = metadata.height;
-    if (!originalWidth || !originalHeight) {
-      return res.json({ success: false, message: "Could not read image dimensions" });
-    }
-
-    const { targetWidth, targetHeight } = computeTargetSize(
-      originalWidth,
-      originalHeight,
-      mode
-    );
-
-    // sharp: for animated GIFs/WebPs, take the first frame only.
-    const processed = await sharp(imageBuffer, { animated: false })
-      .ensureAlpha()
-      .resize(targetWidth, targetHeight, { fit: "fill" })
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-
-    const { data, info } = processed;
-    if (info.channels !== 4) {
-      return res.json({
-        success: false,
-        message: `Expected 4 channels, got ${info.channels}`,
-      });
-    }
-
-    const expectedBytes = info.width * info.height * 4;
-    if (data.length !== expectedBytes) {
-      return res.json({
-        success: false,
-        message: `Buffer size mismatch: ${data.length} vs ${expectedBytes}`,
-      });
-    }
-
-    const payload = {
-      success: true,
-      pixelData: data.toString("base64"),
-      width: info.width,
-      height: info.height,
-      originalWidth,
-      originalHeight,
-      postId: post.id,
-      mode,
-    };
-
-    session.imageCache[cacheKey] = payload;
-    res.json(payload);
+    res.json(await buildPayload(post, cleanMode));
   } catch (err) {
-    console.error("get-next-image failed:", err.message, "url:", fileUrl);
-    res.json({ success: false, message: "Failed to process image" });
+    console.error("get-next-image failed:", err.message, "post:", post.id);
+    res.json({ success: false, message: "Failed to process image", postId: post.id });
   }
 });
 
-/** Kept for compatibility with anything that names a post explicitly. */
+/** Fetch one specific post from the session cache (used for "Original" in the post view). */
 app.post("/get-image", async (req, res) => {
   const { postId, mode = "sample", sessionId } = req.body || {};
 
-  if (typeof sessionId !== "string" || sessionId.length === 0) {
+  if (!validSessionId(sessionId)) {
     return res.json({ success: false, message: "sessionId required" });
   }
+  const cleanMode = VALID_MODES.has(mode) ? mode : "sample";
 
   const session = getSession(sessionId);
-  const index = session.posts.findIndex((p) => String(p.id) === String(postId));
-  if (index === -1) {
-    return res.json({ success: false, message: "Post not found in cache" });
+  const post = session.posts.find((p) => String(p.id) === String(postId));
+  if (!post) {
+    return res.json({ success: false, message: "Post not found in cache", postId });
   }
-  session.cursor = index;
-  return app._router.handle(
-    Object.assign(req, {
-      url: "/get-next-image",
-      body: { mode, sessionId },
-      method: "POST",
-    }),
-    res,
-    () => res.json({ success: false, message: "Internal redirect failed" })
-  );
+
+  try {
+    res.json(await buildPayload(post, cleanMode));
+  } catch (err) {
+    console.error("get-image failed:", err.message, "post:", post.id);
+    res.json({ success: false, message: "Failed to process image", postId: post.id });
+  }
 });
+
+// Tag autocomplete, with a short in-memory cache so typing doesn't hammer e621.
+const AC_TTL_MS = 60 * 1000;
+const AC_MAX_ENTRIES = 300;
+const acCache = new Map(); // query -> { at, suggestions }
 
 app.post("/autocomplete-tags", async (req, res) => {
   const { query = "" } = req.body || {};
-  if (!query || query.trim().length === 0) {
+  const cleanQuery = String(query)
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w\-()]/g, "")
+    .slice(0, 40);
+
+  if (cleanQuery.length < 2) {
     return res.json({ success: true, suggestions: [] });
   }
+
+  const hit = acCache.get(cleanQuery);
+  if (hit && Date.now() - hit.at < AC_TTL_MS) {
+    return res.json({ success: true, suggestions: hit.suggestions });
+  }
+
   try {
-    const cleanQuery = query.trim().replace(/[^\w\s\-_]/g, "");
     const data = await e621Get("/tags.json", {
       "search[name_matches]": `${cleanQuery}*`,
+      "search[order]": "count",
+      "search[hide_empty]": "true",
       limit: 10,
     });
     const tags = Array.isArray(data) ? data : Array.isArray(data.tags) ? data.tags : [];
@@ -331,6 +367,10 @@ app.post("/autocomplete-tags", async (req, res) => {
       postCount: t.post_count || 0,
       category: t.category || 0,
     }));
+
+    if (acCache.size >= AC_MAX_ENTRIES) acCache.delete(acCache.keys().next().value);
+    acCache.set(cleanQuery, { at: Date.now(), suggestions });
+
     res.json({ success: true, suggestions });
   } catch (err) {
     console.error("autocomplete-tags failed:", err.message);
