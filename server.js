@@ -75,17 +75,24 @@ function e621Get(path, params = {}) {
 // --- per-session in-memory state -------------------------------------------
 const SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-/** @type {Map<string, {posts: any[], cursor: number, tags: string, lastUsed: number}>} */
+/** @type {Map<string, {posts: any[], extra: Map<string, any>, cursor: number, tags: string, lastUsed: number}>} */
 const sessions = new Map();
 
 function getSession(sessionId) {
   let s = sessions.get(sessionId);
   if (!s) {
-    s = { posts: [], cursor: 0, tags: "", lastUsed: Date.now() };
+    s = { posts: [], extra: new Map(), cursor: 0, tags: "", lastUsed: Date.now() };
     sessions.set(sessionId, s);
   }
   s.lastUsed = Date.now();
   return s;
+}
+
+// A post from the search results, or one opened from the "From the Artist" panel.
+const EXTRA_MAX = 60;
+function findPost(session, postId) {
+  const key = String(postId);
+  return session.posts.find((p) => String(p.id) === key) || session.extra.get(key) || null;
 }
 
 setInterval(() => {
@@ -442,7 +449,7 @@ app.post("/get-image", async (req, res) => {
   const cleanMode = VALID_MODES.has(mode) ? mode : "sample";
 
   const session = getSession(sessionId);
-  const post = session.posts.find((p) => String(p.id) === String(postId));
+  const post = findPost(session, postId);
   if (!post) {
     return res.json({ success: false, message: "Post not found in cache", postId });
   }
@@ -474,7 +481,7 @@ app.post("/get-tile", async (req, res) => {
   }
 
   const session = getSession(sessionId);
-  const post = session.posts.find((p) => String(p.id) === String(postId));
+  const post = findPost(session, postId);
   if (!post) {
     return res.json({ success: false, message: "Post not found in cache", postId });
   }
@@ -507,6 +514,19 @@ const NON_ARTIST_TAGS = new Set([
 ]);
 
 const artistCache = new Map(); // key -> { at, posts }
+
+/** Same slim shape /fetch-posts caches, so an artist post can be opened like any other. */
+function slimPost(p) {
+  return {
+    id: p.id,
+    sampleUrl: p.sample && p.sample.url ? p.sample.url : null,
+    fileUrl: p.file && p.file.url ? p.file.url : null,
+    width: p.file ? p.file.width : null,
+    height: p.file ? p.file.height : null,
+    rating: p.rating,
+    meta: buildMeta(p),
+  };
+}
 
 /** Download one e621 preview (<=150px) and turn it into the same RGBA payload the Roblox client decodes. */
 async function buildThumb(p) {
@@ -553,7 +573,7 @@ app.post("/artist-posts", async (req, res) => {
     return res.json({ success: false, message: "sessionId required" });
   }
   const session = getSession(sessionId);
-  const post = session.posts.find((p) => String(p.id) === String(postId));
+  const post = findPost(session, postId);
   if (!post) {
     return res.json({ success: false, message: "Post not found in cache", postId });
   }
@@ -582,15 +602,31 @@ app.post("/artist-posts", async (req, res) => {
       // ask for one extra so we can drop the post that is currently open
       const data = await e621Get("/posts.json", { tags: query, limit: cleanLimit + 1 });
       const raw = Array.isArray(data.posts) ? data.posts : [];
-      const built = await Promise.all(raw.map((p) => buildThumb(p).catch(() => null)));
+      const built = await Promise.all(
+        raw.map(async (p) => {
+          const slim = slimPost(p);
+          if (!isSupportedUrl(slim.sampleUrl) && !isSupportedUrl(slim.fileUrl)) return null;
+          const thumb = await buildThumb(p).catch(() => null);
+          return thumb ? { thumb, slim } : null;
+        })
+      );
       list = built.filter(Boolean);
 
       if (artistCache.size >= ARTIST_CACHE_MAX) artistCache.delete(artistCache.keys().next().value);
       artistCache.set(cacheKey, { at: Date.now(), posts: list });
     }
 
-    const posts = list.filter((p) => String(p.id) !== String(post.id)).slice(0, cleanLimit);
-    res.json({ success: true, artist, posts });
+    const entries = list.filter((e) => String(e.slim.id) !== String(post.id)).slice(0, cleanLimit);
+
+    // register them in the session so /get-image, /get-tile and /artist-posts work when one is opened
+    for (const e of entries) {
+      const key = String(e.slim.id);
+      session.extra.delete(key);
+      session.extra.set(key, e.slim);
+    }
+    while (session.extra.size > EXTRA_MAX) session.extra.delete(session.extra.keys().next().value);
+
+    res.json({ success: true, artist, posts: entries.map((e) => e.thumb) });
   } catch (err) {
     console.error("artist-posts failed:", err.message, "post:", post.id);
     res.json({ success: false, message: "Failed to load artist posts", postId: post.id });
