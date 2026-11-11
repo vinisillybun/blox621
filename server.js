@@ -11,8 +11,9 @@ app.use(express.json());
 
 let cachedPosts = [];
 let currentIndex = 0;
+let imageCache = {}; // Stores { original: base64Data, sample: base64Data }
 
-const MAX_DIMENSION = 1024;
+const MAX_EDITABLE_DIMENSION = 1024;
 
 app.post('/fetch-posts', async (req, res) => {
   const { tags = 'rating:safe', page = 1, limit = 30 } = req.body;
@@ -27,13 +28,12 @@ app.post('/fetch-posts', async (req, res) => {
     const response = await axios.get(url, { headers });
     cachedPosts = response.data.posts || [];
     currentIndex = 0;
+    imageCache = {}; // Clear cache for new search
 
     if (cachedPosts.length === 0) {
-      console.log('No posts found for tags:', tags);
       return res.status(404).json({ error: 'No posts found', count: 0 });
     }
 
-    console.log(`Fetched ${cachedPosts.length} posts`);
     res.json({ success: true, count: cachedPosts.length });
 
   } catch (err) {
@@ -51,11 +51,8 @@ app.post('/autocomplete-tags', async (req, res) => {
 
   try {
     const cleanQuery = query.trim().replace(/[^\w\s-_]/g, '');
-
     const url = `https://e621.net/tags/autocomplete.json?search[name_matches]=${encodeURIComponent(cleanQuery)}*`;
     const headers = { 'User-Agent': 'RobloxGame/1.0 (by your_email@example.com)' };
-
-    console.log('Autocomplete request for:', cleanQuery);
 
     const response = await axios.get(url, { headers });
     const tags = response.data || [];
@@ -70,32 +67,35 @@ app.post('/autocomplete-tags', async (req, res) => {
 
   } catch (err) {
     console.error('Error fetching autocomplete:', err.message);
-    console.error('Query was:', query);
     res.status(500).json({ error: 'Failed to fetch autocomplete suggestions', details: err.message });
   }
 });
 
-app.post('/get-next-image', async (req, res) => {
-  while (currentIndex < cachedPosts.length) {
-    const post = cachedPosts[currentIndex];
-    const fileUrl = post.file?.url;
+app.post('/get-image', async (req, res) => {
+  // mode can be 'original' or 'sample'
+  const { postId, mode = 'sample' } = req.body;
 
-    if (fileUrl && !/\.(mp4|webm|gif)$/i.test(fileUrl)) {
-      break;
-    }
-    currentIndex++;
+  // Find the post in cache
+  const post = cachedPosts.find(p => p.id === postId);
+  if (!post) {
+    return res.status(404).json({ success: false, message: 'Post not found in cache' });
   }
 
-  if (currentIndex >= cachedPosts.length) {
-    return res.json({ success: false, message: 'No more images' });
+  // Check local cache first
+  if (imageCache[postId] && imageCache[postId][mode]) {
+    return res.json({ success: true, ...imageCache[postId][mode] });
   }
 
-  const post = cachedPosts[currentIndex];
-  const fileUrl = post.sample?.url || post.file?.url;
+  let fileUrl;
+  if (mode === 'original') {
+    fileUrl = post.file?.url;
+  } else {
+    // Sample mode: use sample URL if available, otherwise fallback to file URL
+    fileUrl = post.sample?.url || post.file?.url;
+  }
 
   if (!fileUrl) {
-    currentIndex++;
-    return res.json({ success: false, message: 'No file URL available' });
+    return res.json({ success: false, message: 'No file URL available for this mode' });
   }
 
   try {
@@ -107,60 +107,61 @@ app.post('/get-next-image', async (req, res) => {
     const originalHeight = metadata.height;
 
     if (!originalWidth || !originalHeight) {
-      currentIndex++;
       return res.json({ success: false, message: 'Could not read image dimensions' });
     }
 
-    const longestSide = Math.max(originalWidth, originalHeight);
-    const needsResize = longestSide > MAX_DIMENSION;
+    let targetWidth = originalWidth;
+    let targetHeight = originalHeight;
+
+    if (mode === 'sample') {
+      // e621 Sample logic: Cap width at 850
+      if (originalWidth > 850) {
+        targetWidth = 850;
+        targetHeight = Math.round(originalHeight * (850 / originalWidth));
+      }
+    } else {
+      // Original mode: Limit to 1024 for Roblox EditableImage
+      if (originalWidth > MAX_EDITABLE_DIMENSION || originalHeight > MAX_EDITABLE_DIMENSION) {
+        const scale = MAX_EDITABLE_DIMENSION / Math.max(originalWidth, originalHeight);
+        targetWidth = Math.round(originalWidth * scale);
+        targetHeight = Math.round(originalHeight * scale);
+      }
+    }
+
+    // Final safety clamp for Roblox limits
+    if (targetWidth > MAX_EDITABLE_DIMENSION || targetHeight > MAX_EDITABLE_DIMENSION) {
+      const scale = MAX_EDITABLE_DIMENSION / Math.max(targetWidth, targetHeight);
+      targetWidth = Math.round(targetWidth * scale);
+      targetHeight = Math.round(targetHeight * scale);
+    }
 
     let pipeline = sharp(imageBuffer).ensureAlpha();
-
-    if (needsResize) {
-      const scale = MAX_DIMENSION / longestSide;
-      const targetWidth = Math.round(originalWidth * scale);
-      const targetHeight = Math.round(originalHeight * scale);
+    if (targetWidth !== originalWidth || targetHeight !== originalHeight) {
       pipeline = pipeline.resize(targetWidth, targetHeight, { fit: 'fill' });
     }
 
     const processed = await pipeline.raw().toBuffer({ resolveWithObject: true });
-
-    const expectedBytes = processed.info.width * processed.info.height * 4;
-    const actualBytes = processed.data.length;
-    console.log(
-      `Sending ${processed.info.width}x${processed.info.height}, ` +
-      `${processed.info.channels} channels, ${actualBytes} bytes ` +
-      `(expected ${expectedBytes}) ${actualBytes === expectedBytes ? 'OK' : 'MISMATCH'}`
-    );
-
-    if (actualBytes !== expectedBytes) {
-      console.warn('Buffer size mismatch, skipping image:', post.id);
-      currentIndex++;
-      return res.json({ success: false, message: 'Pixel buffer size mismatch' });
-    }
-
     const pixelData = processed.data.toString('base64');
 
-    currentIndex++;
-
-    res.json({
+    const responseData = {
       success: true,
       pixelData,
       width: processed.info.width,
       height: processed.info.height,
       originalWidth,
       originalHeight,
-      rating: post.rating,
       postId: post.id,
-      score: post.score?.total || 0,
-      favorites: post.fav_count || 0,
-      comments: post.comment_count || 0,
-      remaining: cachedPosts.length - currentIndex
-    });
+      mode: mode
+    };
+
+    // Save to local cache
+    if (!imageCache[postId]) imageCache[postId] = {};
+    imageCache[postId][mode] = responseData;
+
+    res.json(responseData);
 
   } catch (err) {
-    console.warn('Failed to process image:', fileUrl, err.message);
-    currentIndex++;
+    console.warn(`Failed to process ${mode} image:`, fileUrl, err.message);
     return res.json({ success: false, message: 'Failed to process image' });
   }
 });
