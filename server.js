@@ -26,13 +26,13 @@ const FULL_MAX_ENTRIES = 3; // encoded originals kept in memory (each up to 32 M
 
 // --- gif config ------------------------------------------------------------
 const GIF_MAX_FRAMES = 120;
-const GIF_MAX_DIMENSION = 400;
-const GIF_KEEP_BYTES = 48 * 1024 * 1024;
-const GIF_WORK_BYTES = 96 * 1024 * 1024;
-const GIF_CHUNK_BYTES = 2.5 * 1024 * 1024;
+const GIF_MAX_DIMENSION = 850;
+const GIF_KEEP_BYTES = 128 * 1024 * 1024;
+const GIF_WORK_BYTES = 192 * 1024 * 1024;
+const GIF_CHUNK_BYTES = 4 * 1024 * 1024;
 const GIF_PIXEL_LIMIT = 1000000000;
 const GIF_TTL_MS = 3 * 60 * 1000;
-const GIF_MAX_ENTRIES = 2;
+const GIF_MAX_ENTRIES = 1;
 
 const TAG_CATEGORIES = ["artist", "copyright", "character", "species", "general", "meta", "lore"];
 const VALID_MODES = new Set(["sample", "original"]);
