@@ -24,6 +24,16 @@ const MAX_FULL_DIMENSION = 4096; // longest side of the stitched image (4096 -> 
 const FULL_TTL_MS = 3 * 60 * 1000; // how long a downloaded original is kept for tile requests
 const FULL_MAX_ENTRIES = 3; // encoded originals kept in memory (each up to 32 MB)
 
+// --- gif config ------------------------------------------------------------
+const GIF_MAX_FRAMES = 120;
+const GIF_MAX_DIMENSION = 400;
+const GIF_KEEP_BYTES = 48 * 1024 * 1024;
+const GIF_WORK_BYTES = 96 * 1024 * 1024;
+const GIF_CHUNK_BYTES = 2.5 * 1024 * 1024;
+const GIF_PIXEL_LIMIT = 1000000000;
+const GIF_TTL_MS = 3 * 60 * 1000;
+const GIF_MAX_ENTRIES = 2;
+
 const TAG_CATEGORIES = ["artist", "copyright", "character", "species", "general", "meta", "lore"];
 const VALID_MODES = new Set(["sample", "original"]);
 
@@ -157,12 +167,16 @@ function buildMeta(p) {
   }
   const flags = p.flags || {};
   const created = p.created_at ? Date.parse(p.created_at) : NaN;
+  const ext = (p.file && p.file.ext) || "";
+  const duration = Number(p.duration);
   return {
     tags,
     rating: p.rating || "s",
     score: p.score && typeof p.score.total === "number" ? p.score.total : 0,
     favCount: p.fav_count || 0,
-    ext: (p.file && p.file.ext) || "",
+    ext,
+    animated: ext === "gif",
+    duration: Number.isFinite(duration) && duration > 0 ? Math.round(duration * 100) / 100 : 0,
     fileSize: (p.file && p.file.size) || 0,
     createdAt: Number.isNaN(created) ? 0 : Math.floor(created / 1000), // unix seconds
     description: String(p.description || "").slice(0, 600),
@@ -369,6 +383,132 @@ async function buildTile(sessionId, post, tx, ty) {
   };
 }
 
+// --- animated gif frames -----------------------------------------------------
+/** @type {Map<string, {at: number, promise: Promise<any>}>} */
+const gifCache = new Map();
+
+function trimGifCache() {
+  const cutoff = Date.now() - GIF_TTL_MS;
+  for (const [k, e] of gifCache) {
+    if (e.at < cutoff) gifCache.delete(k);
+  }
+  while (gifCache.size > GIF_MAX_ENTRIES) {
+    gifCache.delete(gifCache.keys().next().value);
+  }
+}
+
+function getGifSource(sessionId, post) {
+  const key = `${sessionId}:${post.id}`;
+  trimGifCache();
+
+  const hit = gifCache.get(key);
+  if (hit) {
+    hit.at = Date.now();
+    return hit.promise;
+  }
+
+  const promise = (async () => {
+    if (!isSupportedUrl(post.fileUrl)) throw new Error("No GIF available");
+
+    const imgRes = await axios.get(post.fileUrl, {
+      responseType: "arraybuffer",
+      headers: { "User-Agent": USER_AGENT },
+      timeout: 45000,
+      maxContentLength: 32 * 1024 * 1024,
+    });
+    const buf = Buffer.from(imgRes.data);
+    if (sniffImageType(buf) !== "gif") throw new Error("Downloaded payload is not a GIF");
+
+    const meta = await sharp(buf).metadata();
+    if (!meta.width || !meta.height) throw new Error("Could not read image dimensions");
+
+    const pages = Math.max(meta.pages || 1, 1);
+    const rawDelays = Array.isArray(meta.delay) ? meta.delay : [];
+    const step = Math.max(1, Math.ceil(pages / GIF_MAX_FRAMES));
+
+    const indices = [];
+    const delays = [];
+    for (let i = 0; i < pages; i += step) {
+      let ms = 0;
+      for (let j = i; j < Math.min(i + step, pages); j++) {
+        const d = rawDelays[j];
+        ms += d > 10 ? d : 100;
+      }
+      indices.push(i);
+      delays.push(ms / 1000);
+    }
+
+    const pixels = meta.width * meta.height;
+    const longest = Math.max(meta.width, meta.height);
+    const scale = Math.min(
+      1,
+      GIF_MAX_DIMENSION / longest,
+      Math.sqrt(GIF_KEEP_BYTES / (4 * indices.length * pixels)),
+      Math.sqrt(GIF_WORK_BYTES / (4 * pages * pixels))
+    );
+    const width = Math.max(1, Math.round(meta.width * scale));
+    const height = Math.max(1, Math.round(meta.height * scale));
+    const frameBytes = width * height * 4;
+
+    const { data, info } = await sharp(buf, { animated: true, pages: -1, limitInputPixels: GIF_PIXEL_LIMIT })
+      .ensureAlpha()
+      .resize(width, height, { fit: "fill" })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    if (info.channels !== 4 || data.length !== frameBytes * pages) {
+      throw new Error("Animated buffer size mismatch");
+    }
+
+    const frames = indices.map((i) => Buffer.from(data.subarray(i * frameBytes, (i + 1) * frameBytes)));
+
+    return {
+      frames,
+      delays,
+      width,
+      height,
+      srcWidth: meta.width,
+      srcHeight: meta.height,
+      duration: delays.reduce((a, b) => a + b, 0),
+    };
+  })();
+
+  const entry = { at: Date.now(), promise };
+  gifCache.set(key, entry);
+  promise.catch(() => {
+    if (gifCache.get(key) === entry) gifCache.delete(key);
+  });
+  return promise;
+}
+
+async function buildGifFrames(sessionId, post, start) {
+  const src = await getGifSource(sessionId, post);
+  const total = src.frames.length;
+
+  if (start < 0 || start >= total) {
+    return { success: false, message: "Frame out of range", postId: post.id, start };
+  }
+
+  const perChunk = Math.max(1, Math.floor(GIF_CHUNK_BYTES / (src.width * src.height * 4)));
+  const end = Math.min(total, start + perChunk);
+
+  return {
+    success: true,
+    postId: post.id,
+    start,
+    count: end - start,
+    nextIndex: end,
+    total,
+    width: src.width,
+    height: src.height,
+    delays: src.delays,
+    duration: src.duration,
+    originalWidth: src.srcWidth,
+    originalHeight: src.srcHeight,
+    frames: src.frames.slice(start, end).map((f) => f.toString("base64")),
+  };
+}
+
 // --- grid thumbnails ---------------------------------------------------------
 const THUMB_MAX_DIMENSION = 150;
 const THUMB_CHUNK_MAX = 24; // hard cap per request
@@ -435,7 +575,13 @@ async function buildGridThumb(post, index) {
 // --- routes ----------------------------------------------------------------
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "Blox621", sessions: sessions.size, fullCache: fullCache.size });
+  res.json({
+    ok: true,
+    service: "Blox621",
+    sessions: sessions.size,
+    fullCache: fullCache.size,
+    gifCache: gifCache.size,
+  });
 });
 
 app.post("/fetch-posts", async (req, res) => {
@@ -501,9 +647,9 @@ app.post("/post-count", async (req, res) => {
   }
 
   try {
-   const data = await e621Get("/posts/count.json", { tags });
-   const raw = data && data.count !== undefined ? data.count : data && data.counts && data.counts.posts;
-   const total = Number(raw);
+    const data = await e621Get("/posts/count.json", { tags });
+    const raw = data && data.count !== undefined ? data.count : data && data.counts && data.counts.posts;
+    const total = Number(raw);
     if (!Number.isFinite(total) || total < 0) {
       return res.json({ success: false, message: "Unexpected count response" });
     }
@@ -627,6 +773,35 @@ app.post("/get-tile", async (req, res) => {
   } catch (err) {
     console.error("get-tile failed:", err.message, "post:", post.id, "tile:", col, row);
     res.json({ success: false, message: "Failed to process tile", postId: post.id, tx: col, ty: row });
+  }
+});
+
+/**
+ * Animation frames of a GIF post, served in chunks.
+ * Body: { sessionId, postId, start }  (start = index of the first frame wanted)
+ */
+app.post("/get-gif-frames", async (req, res) => {
+  const { postId, start, sessionId } = req.body || {};
+
+  if (!validSessionId(sessionId)) {
+    return res.json({ success: false, message: "sessionId required" });
+  }
+  const from = Number.isInteger(start) ? start : parseInt(start, 10);
+  if (!Number.isInteger(from) || from < 0) {
+    return res.json({ success: false, message: "start required", postId });
+  }
+
+  const session = getSession(sessionId);
+  const post = findPost(session, postId);
+  if (!post) {
+    return res.json({ success: false, message: "Post not found in cache", postId });
+  }
+
+  try {
+    res.json(await buildGifFrames(sessionId, post, from));
+  } catch (err) {
+    console.error("get-gif-frames failed:", err.message, "post:", post.id, "start:", from);
+    res.json({ success: false, message: "Failed to process GIF", postId: post.id, start: from });
   }
 });
 
