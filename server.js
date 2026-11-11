@@ -75,13 +75,13 @@ function e621Get(path, params = {}) {
 // --- per-session in-memory state -------------------------------------------
 const SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-/** @type {Map<string, {posts: any[], cursor: number, lastUsed: number}>} */
+/** @type {Map<string, {posts: any[], cursor: number, tags: string, lastUsed: number}>} */
 const sessions = new Map();
 
 function getSession(sessionId) {
   let s = sessions.get(sessionId);
   if (!s) {
-    s = { posts: [], cursor: 0, lastUsed: Date.now() };
+    s = { posts: [], cursor: 0, tags: "", lastUsed: Date.now() };
     sessions.set(sessionId, s);
   }
   s.lastUsed = Date.now();
@@ -392,6 +392,7 @@ app.post("/fetch-posts", async (req, res) => {
     const session = getSession(sessionId);
     session.posts = slim;
     session.cursor = 0;
+    session.tags = finalTags; // used by /artist-posts to keep the player's rating: filters
 
     res.json({
       success: true,
@@ -483,6 +484,116 @@ app.post("/get-tile", async (req, res) => {
   } catch (err) {
     console.error("get-tile failed:", err.message, "post:", post.id, "tile:", col, row);
     res.json({ success: false, message: "Failed to process tile", postId: post.id, tx: col, ty: row });
+  }
+});
+
+// --- "From the Artist" thumbnails -------------------------------------------
+const ARTIST_DEFAULT_LIMIT = 6;
+const ARTIST_MAX_LIMIT = 12;
+const ARTIST_TTL_MS = 3 * 60 * 1000;
+const ARTIST_CACHE_MAX = 20;
+
+// artist-category tags on e621 that are not real artists
+const NON_ARTIST_TAGS = new Set([
+  "conditional_dnp",
+  "unknown_artist",
+  "anonymous_artist",
+  "unknown_artist_signature",
+  "avoid_posting",
+  "sound_warning",
+  "epilepsy_warning",
+  "third-party_edit",
+  "editor_notes",
+]);
+
+const artistCache = new Map(); // key -> { at, posts }
+
+/** Download one e621 preview (<=150px) and turn it into the same RGBA payload the Roblox client decodes. */
+async function buildThumb(p) {
+  const url = p.preview && p.preview.url;
+  if (!isSupportedUrl(url)) return null;
+
+  const imgRes = await axios.get(url, {
+    responseType: "arraybuffer",
+    headers: { "User-Agent": USER_AGENT },
+    timeout: 15000,
+    maxContentLength: 4 * 1024 * 1024,
+  });
+  const buf = Buffer.from(imgRes.data);
+  if (!sniffImageType(buf)) return null;
+
+  const { data, info } = await sharp(buf, { animated: false })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  if (info.channels !== 4 || data.length !== info.width * info.height * 4) return null;
+
+  return {
+    id: p.id,
+    rating: p.rating || "s",
+    score: p.score && typeof p.score.total === "number" ? p.score.total : 0,
+    favCount: p.fav_count || 0,
+    commentCount: p.comment_count || 0,
+    width: info.width,
+    height: info.height,
+    pixelData: data.toString("base64"),
+  };
+}
+
+/**
+ * Other posts by the open post's artist.
+ * Body: { sessionId, postId, limit? }
+ * Keeps any rating: filters from the player's own search so the panel never
+ * shows a rating they filtered out.
+ */
+app.post("/artist-posts", async (req, res) => {
+  const { postId, sessionId, limit = ARTIST_DEFAULT_LIMIT } = req.body || {};
+
+  if (!validSessionId(sessionId)) {
+    return res.json({ success: false, message: "sessionId required" });
+  }
+  const session = getSession(sessionId);
+  const post = session.posts.find((p) => String(p.id) === String(postId));
+  if (!post) {
+    return res.json({ success: false, message: "Post not found in cache", postId });
+  }
+
+  const artists = ((post.meta && post.meta.tags && post.meta.tags.artist) || []).filter(
+    (t) => !NON_ARTIST_TAGS.has(t)
+  );
+  if (artists.length === 0) {
+    return res.json({ success: true, artist: null, posts: [] });
+  }
+  const artist = artists[0];
+
+  const cleanLimit = Math.min(Math.max(parseInt(limit, 10) || ARTIST_DEFAULT_LIMIT, 1), ARTIST_MAX_LIMIT);
+  const ratingTokens = String(session.tags || "")
+    .split(/\s+/)
+    .filter((t) => /^[-~]?rating:/i.test(t));
+  const query = [artist, ...ratingTokens].join(" ");
+
+  try {
+    const cacheKey = `${query}|${cleanLimit}`;
+    let list;
+    const hit = artistCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < ARTIST_TTL_MS) {
+      list = hit.posts;
+    } else {
+      // ask for one extra so we can drop the post that is currently open
+      const data = await e621Get("/posts.json", { tags: query, limit: cleanLimit + 1 });
+      const raw = Array.isArray(data.posts) ? data.posts : [];
+      const built = await Promise.all(raw.map((p) => buildThumb(p).catch(() => null)));
+      list = built.filter(Boolean);
+
+      if (artistCache.size >= ARTIST_CACHE_MAX) artistCache.delete(artistCache.keys().next().value);
+      artistCache.set(cacheKey, { at: Date.now(), posts: list });
+    }
+
+    const posts = list.filter((p) => String(p.id) !== String(post.id)).slice(0, cleanLimit);
+    res.json({ success: true, artist, posts });
+  } catch (err) {
+    console.error("artist-posts failed:", err.message, "post:", post.id);
+    res.json({ success: false, message: "Failed to load artist posts", postId: post.id });
   }
 });
 
