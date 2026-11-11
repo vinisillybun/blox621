@@ -11,12 +11,18 @@ sharp.cache(false); // don't keep decoded originals in sharp's internal cache
 // --- e621 config -----------------------------------------------------------
 const USER_AGENT = "Blox621/1.0 (Roblox experience; contact: your_email@example.com)";
 const E621_BASE = "https://e621.net";
-const MAX_EDITABLE_DIMENSION = 1024; // Roblox EditableImage limit (also caps "original")
+const MAX_EDITABLE_DIMENSION = 1024; // Roblox EditableImage limit for ONE image (caps "original")
 const DEFAULT_LIMIT = 30;
 const MAX_LIMIT = 320;
 
 const SAMPLE_MAX_DIMENSION = 850; // "longest side capped at 850"
 const MIN_REQUEST_INTERVAL_MS = 1000;
+
+// --- tiled full-resolution config ------------------------------------------
+const TILE_SIZE = 1024; // one tile = one EditableImage on the client
+const MAX_FULL_DIMENSION = 4096; // longest side of the stitched image (4096 -> up to 16 tiles, ~64 MB of textures)
+const FULL_TTL_MS = 3 * 60 * 1000; // how long a downloaded original is kept for tile requests
+const FULL_MAX_ENTRIES = 3; // encoded originals kept in memory (each up to 32 MB)
 
 const TAG_CATEGORIES = ["artist", "copyright", "character", "species", "general", "meta", "lore"];
 const VALID_MODES = new Set(["sample", "original"]);
@@ -228,10 +234,126 @@ async function buildPayload(post, mode) {
   };
 }
 
+// --- tiled full-resolution images ------------------------------------------
+// A Roblox EditableImage is limited to 1024x1024, so a bigger picture is sent as
+// a grid of TILE_SIZE tiles that the client stitches together. The downloaded
+// original is kept briefly (encoded, a few MB) so the tile requests for one post
+// don't each re-download it.
+
+/** @type {Map<string, {at: number, promise: Promise<any>}>} */
+const fullCache = new Map();
+
+function trimFullCache() {
+  const cutoff = Date.now() - FULL_TTL_MS;
+  for (const [k, e] of fullCache) {
+    if (e.at < cutoff) fullCache.delete(k);
+  }
+  while (fullCache.size > FULL_MAX_ENTRIES) {
+    fullCache.delete(fullCache.keys().next().value);
+  }
+}
+
+function getFullSource(sessionId, post) {
+  const key = `${sessionId}:${post.id}`;
+  trimFullCache();
+
+  const hit = fullCache.get(key);
+  if (hit) {
+    hit.at = Date.now();
+    return hit.promise;
+  }
+
+  const promise = (async () => {
+    if (!isSupportedUrl(post.fileUrl)) throw new Error("No static original available");
+
+    const imgRes = await axios.get(post.fileUrl, {
+      responseType: "arraybuffer",
+      headers: { "User-Agent": USER_AGENT },
+      timeout: 45000,
+      maxContentLength: 32 * 1024 * 1024,
+    });
+    const buf = Buffer.from(imgRes.data);
+    if (!sniffImageType(buf)) throw new Error("Downloaded payload is not a supported image");
+
+    const meta = await sharp(buf).metadata();
+    if (!meta.width || !meta.height) throw new Error("Could not read image dimensions");
+
+    const longest = Math.max(meta.width, meta.height);
+    const scale = longest > MAX_FULL_DIMENSION ? MAX_FULL_DIMENSION / longest : 1;
+    const fullWidth = Math.max(1, Math.round(meta.width * scale));
+    const fullHeight = Math.max(1, Math.round(meta.height * scale));
+
+    return {
+      buf,
+      srcWidth: meta.width,
+      srcHeight: meta.height,
+      fullWidth,
+      fullHeight,
+      cols: Math.ceil(fullWidth / TILE_SIZE),
+      rows: Math.ceil(fullHeight / TILE_SIZE),
+    };
+  })();
+
+  const entry = { at: Date.now(), promise };
+  fullCache.set(key, entry);
+  promise.catch(() => {
+    if (fullCache.get(key) === entry) fullCache.delete(key);
+  });
+  return promise;
+}
+
+async function buildTile(sessionId, post, tx, ty) {
+  const src = await getFullSource(sessionId, post);
+
+  if (tx < 0 || ty < 0 || tx >= src.cols || ty >= src.rows) {
+    return { success: false, message: "Tile out of range", postId: post.id, tx, ty };
+  }
+
+  const left = tx * TILE_SIZE;
+  const top = ty * TILE_SIZE;
+  const width = Math.min(TILE_SIZE, src.fullWidth - left);
+  const height = Math.min(TILE_SIZE, src.fullHeight - top);
+
+  // resize() before extract() makes sharp crop AFTER resizing, so the tile
+  // comes out of the already-scaled (<= MAX_FULL_DIMENSION) image.
+  let img = sharp(src.buf, { animated: false });
+  if (src.fullWidth !== src.srcWidth || src.fullHeight !== src.srcHeight) {
+    img = img.resize(src.fullWidth, src.fullHeight, { fit: "fill" });
+  }
+
+  const { data, info } = await img
+    .extract({ left, top, width, height })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  if (info.channels !== 4 || data.length !== info.width * info.height * 4) {
+    return { success: false, message: "Tile buffer mismatch", postId: post.id, tx, ty };
+  }
+
+  return {
+    success: true,
+    postId: post.id,
+    tx,
+    ty,
+    cols: src.cols,
+    rows: src.rows,
+    x: left, // tile position inside the stitched image, in pixels
+    y: top,
+    width: info.width,
+    height: info.height,
+    fullWidth: src.fullWidth, // size of the stitched image
+    fullHeight: src.fullHeight,
+    originalWidth: src.srcWidth,
+    originalHeight: src.srcHeight,
+    pixelData: data.toString("base64"),
+  };
+}
+
 // --- routes ----------------------------------------------------------------
 
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "Blox621", sessions: sessions.size });
+  res.json({ ok: true, service: "Blox621", sessions: sessions.size, fullCache: fullCache.size });
 });
 
 app.post("/fetch-posts", async (req, res) => {
@@ -329,6 +451,38 @@ app.post("/get-image", async (req, res) => {
   } catch (err) {
     console.error("get-image failed:", err.message, "post:", post.id);
     res.json({ success: false, message: "Failed to process image", postId: post.id });
+  }
+});
+
+/**
+ * One 1024px tile of a post's full-resolution original.
+ * Body: { sessionId, postId, tx, ty }  (tx = column, ty = row, both 0-based)
+ * The first response (any tile) tells the client the grid size (cols/rows) and
+ * the stitched size (fullWidth/fullHeight); each tile says where it goes (x/y).
+ */
+app.post("/get-tile", async (req, res) => {
+  const { postId, tx, ty, sessionId } = req.body || {};
+
+  if (!validSessionId(sessionId)) {
+    return res.json({ success: false, message: "sessionId required" });
+  }
+  const col = Number.isInteger(tx) ? tx : parseInt(tx, 10);
+  const row = Number.isInteger(ty) ? ty : parseInt(ty, 10);
+  if (!Number.isInteger(col) || !Number.isInteger(row)) {
+    return res.json({ success: false, message: "tx and ty required", postId });
+  }
+
+  const session = getSession(sessionId);
+  const post = session.posts.find((p) => String(p.id) === String(postId));
+  if (!post) {
+    return res.json({ success: false, message: "Post not found in cache", postId });
+  }
+
+  try {
+    res.json(await buildTile(sessionId, post, col, row));
+  } catch (err) {
+    console.error("get-tile failed:", err.message, "post:", post.id, "tile:", col, row);
+    res.json({ success: false, message: "Failed to process tile", postId: post.id, tx: col, ty: row });
   }
 });
 
