@@ -16,7 +16,7 @@ try {
 }
 
 const app = express();
-const PORT = proces
+const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "1mb" }));
 sharp.cache(false);
@@ -31,7 +31,11 @@ const SAMPLE_MAX_DIMENSION = 850;
 const MIN_REQUEST_INTERVAL_MS = 1000;
 
 const TILE_SIZE = 1024;
-const MAX_FULL_DIME
+const MAX_FULL_DIMENSION = 4096;
+const FULL_TTL_MS = 3 * 60 * 1000;
+const FULL_MAX_ENTRIES = 3;
+
+const GIF_MAX_FRAMES = 120;
 const GIF_MAX_DIMENSION = 850;
 const GIF_KEEP_BYTES = 128 * 1024 * 1024;
 const GIF_WORK_BYTES = 192 * 1024 * 1024;
@@ -47,12 +51,18 @@ const VIDEO_MAX_FRAMES = 360;
 const VIDEO_KEEP_BYTES = 96 * 1024 * 1024;
 const VIDEO_FIRST_CHUNK_BYTES = 2 * 1024 * 1024;
 const VIDEO_CHUNK_BYTES = 4 * 1024 * 1024;
-const VIDEO_WAIT_MS
-const AUDIO_BITS_PER_SAMPLE = 16; // 16-bit PCM
-const AUDIO_BYTES_PER_FRAME = AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8); // 4 bytes per stereo frame
-const AUDIO_CHUNK_MS = 100; // Audio chunk size in ms
+const VIDEO_WAIT_MS = 15000;
+const VIDEO_TTL_MS = 3 * 60 * 1000;
+const VIDEO_MAX_ENTRIES = 1;
+const VIDEO_DOWNLOAD_LIMIT = 100 * 1024 * 1024;
+
+const AUDIO_SAMPLE_RATE = 48000;
+const AUDIO_CHANNELS = 2;
+const AUDIO_BITS_PER_SAMPLE = 16;
+const AUDIO_BYTES_PER_FRAME = AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8);
+const AUDIO_CHUNK_MS = 100;
 const AUDIO_CHUNK_FRAMES = Math.floor(AUDIO_SAMPLE_RATE * AUDIO_CHUNK_MS / 1000);
-const AUDIO_CHUNK_BYTES = AUDIO_CHUNK_FRAMES * AUDIO_BYTES_PER_FRAME; // ~19.2KB per 100ms chunk
+const AUDIO_CHUNK_BYTES = AUDIO_CHUNK_FRAMES * AUDIO_BYTES_PER_FRAME;
 
 const TAG_CATEGORIES = ["artist", "copyright", "character", "species", "general", "meta", "lore"];
 const VALID_MODES = new Set(["sample", "original"]);
@@ -63,7 +73,14 @@ let lastRequestAt = 0;
 let queue = Promise.resolve();
 
 function e621Get(path, params = {}) {
-  const run = async
+  const run = async () => {
+    const wait = MIN_REQUEST_INTERVAL_MS - (Date.now() - lastRequestAt);
+    if (wait > 0) await sleep(wait);
+    lastRequestAt = Date.now();
+
+    const res = await axios.get(E621_BASE + path, {
+      params,
+      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
       timeout: 15000,
       validateStatus: () => true,
     });
@@ -79,7 +96,14 @@ function e621Get(path, params = {}) {
       throw err;
     }
     if (res.status < 200 || res.status >= 300) {
-      const err = new
+      const err = new Error(`e621 returned ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return res.data;
+  };
+
+  const p = queue.then(run, run);
   queue = p.catch(() => {});
   return p;
 }
@@ -96,6 +120,13 @@ function getSession(sessionId) {
   }
   s.lastUsed = Date.now();
   return s;
+}
+
+const EXTRA_MAX = 60;
+function findPost(session, postId) {
+  const key = String(postId);
+  return session.posts.find((p) => String(p.id) === key) || session.extra.get(key) || null;
+}
 
 setInterval(() => {
   const cutoff = Date.now() - SESSION_TTL_MS;
@@ -172,7 +203,9 @@ function buildMeta(p) {
     duration: Number.isFinite(duration) && duration > 0 ? Math.round(duration * 100) / 100 : 0,
     fileSize: (p.file && p.file.size) || 0,
     createdAt: Number.isNaN(created) ? 0 : Math.floor(created / 1000),
-    description: String(
+    description: String(p.description || "").slice(0, 600),
+    status: flags.deleted ? "Deleted" : flags.pending ? "Pending" : flags.flagged ? "Flagged" : "Active",
+    commentCount: p.comment_count || 0,
   };
 }
 
@@ -195,6 +228,7 @@ function pickVideoSource(p) {
       };
     }
   }
+
   const fileUrl = p.file && p.file.url;
   if (isVideoUrl(fileUrl)) {
     return { url: fileUrl, ext, width: p.file.width, height: p.file.height };
@@ -231,7 +265,8 @@ async function buildPayload(post, mode) {
 
   const imgRes = await axios.get(fileUrl, {
     responseType: "arraybuffer",
-    headers: { "User-Age
+    headers: { "User-Agent": USER_AGENT },
+    timeout: 30000,
     maxContentLength: 32 * 1024 * 1024,
   });
   const imageBuffer = Buffer.from(imgRes.data);
@@ -339,7 +374,8 @@ function getFullSource(sessionId, post) {
 async function buildTile(sessionId, post, tx, ty) {
   const src = await getFullSource(sessionId, post);
 
-  if (tx < 0 || ty < 0 || tx
+  if (tx < 0 || ty < 0 || tx >= src.cols || ty >= src.rows) {
+    return { success: false, message: "Tile out of range", postId: post.id, tx, ty };
   }
 
   const left = tx * TILE_SIZE;
@@ -415,6 +451,8 @@ function getGifSource(sessionId, post) {
     const buf = Buffer.from(imgRes.data);
     if (sniffImageType(buf) !== "gif") throw new Error("Downloaded payload is not a GIF");
 
+    const meta = await sharp(buf).metadata();
+    if (!meta.width || !meta.height) throw new Error("Could not read image dimensions");
 
     const pages = Math.max(meta.pages || 1, 1);
     const rawDelays = Array.isArray(meta.delay) ? meta.delay : [];
@@ -436,6 +474,8 @@ function getGifSource(sessionId, post) {
     const longest = Math.max(meta.width, meta.height);
     const scale = Math.min(
       1,
+      GIF_MAX_DIMENSION / longest,
+      Math.sqrt(GIF_KEEP_BYTES / (4 * indices.length * pixels)),
       Math.sqrt(GIF_WORK_BYTES / (4 * pages * pixels))
     );
     const width = Math.max(1, Math.round(meta.width * scale));
@@ -504,6 +544,13 @@ async function buildGifFrames(sessionId, post, start) {
 const videoCache = new Map();
 
 function stopVideoEntry(entry) {
+  if (entry.download) {
+    try {
+      entry.download.destroy();
+    } catch (err) {
+      console.warn("could not stop download:", err.message);
+    }
+  }
   if (entry.proc && !entry.done) {
     try {
       entry.proc.kill("SIGKILL");
@@ -521,7 +568,9 @@ function stopVideoEntry(entry) {
 }
 
 function trimVideoCache() {
-  const cutoff = Date.now(
+  const cutoff = Date.now() - VIDEO_TTL_MS;
+  for (const [k, e] of videoCache) {
+    if (e.at < cutoff) {
       stopVideoEntry(e);
       videoCache.delete(k);
     }
@@ -533,20 +582,30 @@ function trimVideoCache() {
   }
 }
 
+function cleanupVideoFile(entry) {
+  if (entry.tmpFile && entry.done && entry.audioDone) {
+    fs.unlink(entry.tmpFile, () => {});
+    entry.tmpFile = null;
+  }
+}
+
 function finishVideo(entry, err) {
   if (entry.done) return;
   if (err) entry.error = err;
   entry.done = true;
-  if (entry.tmpFile) fs.unlink(entry.tmpFile, () => {});
+  cleanupVideoFile(entry);
   entry.events.emit("progress");
 }
 
 function finishAudio(entry, err) {
-  if (entry.audioDone) ret
+  if (entry.audioDone) return;
+  if (err) entry.audioError = err;
+  entry.audioDone = true;
+  cleanupVideoFile(entry);
   entry.events.emit("audioProgress");
 }
 
-function spawnFfmpegVideo(entry, input, maxFrames) {
+function spawnFfmpeg(entry, input, maxFrames) {
   const viaPipe = input === "pipe:0";
   const args = [
     "-v", "error",
@@ -606,23 +665,23 @@ function spawnFfmpegAudio(entry, input) {
   entry.audioProc = proc;
 
   let carry = Buffer.alloc(0);
+  let stderr = "";
 
   proc.stdout.on("data", (chunk) => {
     carry = carry.length ? Buffer.concat([carry, chunk]) : chunk;
     while (carry.length >= AUDIO_CHUNK_BYTES) {
-      const audioChunk = Buffer.from(carry.subarray(0, AUDIO_CHUNK_BYTES));
-      entry.audioChunks.push(audioChunk);
+      entry.audioChunks.push(Buffer.from(carry.subarray(0, AUDIO_CHUNK_BYTES)));
       carry = carry.subarray(AUDIO_CHUNK_BYTES);
     }
     entry.events.emit("audioProgress");
   });
   proc.stderr.on("data", (chunk) => {
-    // Audio stderr handled separately
+    if (stderr.length < 4000) stderr += chunk.toString();
   });
   proc.on("error", (err) => finishAudio(entry, err));
   proc.on("close", (code) => {
-    if (entry.audioChunks.length === 0 && !entry.error) {
-      finishAudio(entry, new Error(`audio ffmpeg exited with code ${code}`));
+    if (entry.audioChunks.length === 0) {
+      finishAudio(entry, new Error(stderr.trim().slice(-300) || `audio ffmpeg exited with code ${code}`));
     } else {
       finishAudio(entry);
     }
@@ -631,6 +690,8 @@ function spawnFfmpegAudio(entry, input) {
 
   return proc;
 }
+
+function runVideo(entry, source, maxFrames) {
   const viaPipe = source.ext === "webm";
 
   (async () => {
@@ -644,6 +705,7 @@ function spawnFfmpegAudio(entry, input) {
       res.data.destroy();
       return;
     }
+    entry.download = res.data;
 
     let received = 0;
     res.data.on("data", (chunk) => {
@@ -652,11 +714,29 @@ function spawnFfmpegAudio(entry, input) {
     });
 
     if (viaPipe) {
-      // We need to split the stream - but piping to two processes from one stream is tricky
-      // For now, we'll do two downloads for pipe-based (webm) - acceptable tradeoff
-      res.data.destroy();
-      // Re-fetch for audio
-      fetchForAudio(entry, source);
+      const video = spawnFfmpeg(entry, "pipe:0", maxFrames);
+      if (!entry.wantAudio) {
+        await pipeline(res.data, video.stdin);
+      } else {
+        const audio = spawnFfmpegAudio(entry, "pipe:0");
+        const sinks = [video.stdin, audio.stdin];
+        await new Promise((resolve, reject) => {
+          let open = sinks.length;
+          for (const sink of sinks) {
+            sink.on("close", () => {
+              open -= 1;
+              if (open === 0) res.data.destroy();
+            });
+            res.data.pipe(sink);
+          }
+          res.data.on("end", resolve);
+          res.data.on("close", resolve);
+          res.data.on("error", (err) => {
+            for (const sink of sinks) sink.end();
+            reject(err);
+          });
+        });
+      }
     } else {
       entry.tmpFile = path.join(
         os.tmpdir(),
@@ -664,25 +744,16 @@ function spawnFfmpegAudio(entry, input) {
       );
       await pipeline(res.data, fs.createWriteStream(entry.tmpFile));
       if (entry.done) return;
-      spawnFfmpegVideo(entry, entry.tmpFile, maxFrames);
-      spawnFfmpegAudio(entry, entry.tmpFile);
+      spawnFfmpeg(entry, entry.tmpFile, maxFrames);
+      if (entry.wantAudio) spawnFfmpegAudio(entry, entry.tmpFile);
     }
   })().catch((err) => {
     if (entry.frames.length === 0) {
       stopVideoEntry(entry);
       finishVideo(entry, err);
+      finishAudio(entry, err);
     }
   });
-}
-
-async function fetchForAudio(entry, source) {
-  const res = await axios.get(source.url, {
-    responseType: "stream",
-    headers: { "User-Agent": USER_AGENT },
-    timeout: 30000,
-  });
-  const proc = spawnFfmpegAudio(entry, "pipe:0");
-  await pipeline(res.data, proc.stdin);
 }
 
 function startVideo(post) {
@@ -703,6 +774,7 @@ function startVideo(post) {
   const fps = duration > 0
     ? Math.min(VIDEO_MAX_FPS, Math.max(VIDEO_MIN_FPS, maxFrames / duration))
     : VIDEO_MAX_FPS;
+  const wantAudio = !!(post.meta && post.meta.hasSound);
 
   const entry = {
     at: Date.now(),
@@ -710,6 +782,7 @@ function startVideo(post) {
     done: false,
     error: null,
     proc: null,
+    download: null,
     tmpFile: null,
     events: new EventEmitter(),
     width,
@@ -717,20 +790,15 @@ function startVideo(post) {
     frameBytes,
     fps,
     delay: 1 / fps,
+    duration,
     expected: duration > 0 ? Math.min(maxFrames, Math.ceil(duration * fps)) : 0,
     srcWidth: Number(post.width) || srcWidth,
     srcHeight: Number(post.height) || srcHeight,
-    // Audio fields
+    wantAudio,
     audioChunks: [],
-    audioDone: false,
+    audioDone: !wantAudio,
     audioError: null,
     audioProc: null,
-    audioSampleRate: AUDIO_SAMPLE_RATE,
-    audioChannels: AUDIO_CHANNELS,
-    audioBitsPerSample: AUDIO_BITS_PER_SAMPLE,
-    audioBytesPerFrame: AUDIO_BYTES_PER_FRAME,
-    audioChunkFrames: AUDIO_CHUNK_FRAMES,
-    audioChunkMs: AUDIO_CHUNK_MS,
   };
   entry.events.setMaxListeners(50);
 
@@ -744,6 +812,7 @@ function getVideoSource(sessionId, post) {
 
   const hit = videoCache.get(key);
   if (hit) {
+    hit.at = Date.now();
     return hit;
   }
 
@@ -795,30 +864,35 @@ async function buildVideoFrames(sessionId, post, start) {
     duration: src.duration,
     originalWidth: src.srcWidth,
     originalHeight: src.srcHeight,
-    frames: src.frames.sli
+    frames: src.frames.slice(start, end).map((f) => f.toString("base64")),
+  };
 }
 
-// New endpoint for audio chunks
-async function buildAudioChunks(sessionId, post, startChunk) {
-  const src = getVideoSource(sessionId, post);
-  const chunksNeeded = Math.max(1, Math.floor(VIDEO_CHUNK_BYTES / AUDIO_CHUNK_BYTES));
-
-  // Wait for audio chunks
-  await new Promise((resolve) => {
-    const check = () => {
-      if (src.audioChunks.length >= startChunk + chunksNeeded || src.audioDone) {
-        src.events.off("audioProgress", check);
-        resolve();
-      }
-    };
-    const timer = setTimeout(() => {
+function waitForAudio(src, need) {
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
       src.events.off("audioProgress", check);
       resolve();
-    }, VIDEO_WAIT_MS);
-    src.events.on("audioPr
+    };
+    const check = () => {
+      if (src.audioChunks.length >= need || src.audioDone) finish();
+    };
+    const timer = setTimeout(finish, VIDEO_WAIT_MS);
+    src.events.on("audioProgress", check);
+    check();
+  });
+}
+
+async function buildAudioChunks(sessionId, post, startChunk) {
+  const src = getVideoSource(sessionId, post);
+  const perChunk = Math.max(1, Math.floor(VIDEO_CHUNK_BYTES / AUDIO_CHUNK_BYTES));
+
+  await waitForAudio(src, startChunk + perChunk);
+
   if (src.audioError && src.audioChunks.length <= startChunk) throw src.audioError;
 
-  const end = Math.max(startChunk, Math.min(src.audioChunks.length, startChunk + chunksNeeded));
+  const end = Math.max(startChunk, Math.min(src.audioChunks.length, startChunk + perChunk));
   const finished = src.audioDone && end >= src.audioChunks.length;
 
   return {
@@ -829,12 +903,12 @@ async function buildAudioChunks(sessionId, post, startChunk) {
     nextChunk: end,
     done: finished,
     totalChunks: finished ? src.audioChunks.length : Math.ceil((src.duration * 1000) / AUDIO_CHUNK_MS),
-    sampleRate: src.audioSampleRate,
-    channels: src.audioChannels,
-    bitsPerSample: src.audioBitsPerSample,
-    bytesPerFrame: src.audioBytesPerFrame,
-    chunkFrames: src.audioChunkFrames,
-    chunkMs: src.audioChunkMs,
+    sampleRate: AUDIO_SAMPLE_RATE,
+    channels: AUDIO_CHANNELS,
+    bitsPerSample: AUDIO_BITS_PER_SAMPLE,
+    bytesPerFrame: AUDIO_BYTES_PER_FRAME,
+    chunkFrames: AUDIO_CHUNK_FRAMES,
+    chunkMs: AUDIO_CHUNK_MS,
     duration: src.duration,
     audioChunks: src.audioChunks.slice(startChunk, end).map((c) => c.toString("base64")),
   };
@@ -845,6 +919,9 @@ const THUMB_CHUNK_MAX = 24;
 const THUMB_CONCURRENCY = 6;
 
 let thumbActive = 0;
+const thumbWaiters = [];
+async function withThumbSlot(fn) {
+  if (thumbActive >= THUMB_CONCURRENCY) {
     await new Promise((resolve) => thumbWaiters.push(resolve));
   }
   thumbActive++;
@@ -901,7 +978,7 @@ app.get("/", (req, res) => {
     service: "Blox621",
     sessions: sessions.size,
     fullCache: fullCache.size,
-    gifCache: gifCache.si
+    gifCache: gifCache.size,
     videoCache: videoCache.size,
   });
 });
@@ -922,6 +999,9 @@ app.post("/fetch-posts", async (req, res) => {
     const data = await e621Get("/posts.json", {
       tags: finalTags,
       limit: cleanLimit,
+      page: cleanPage,
+    });
+
     const posts = Array.isArray(data.posts) ? data.posts : [];
 
     const slim = posts
@@ -1044,7 +1124,10 @@ app.post("/get-image", async (req, res) => {
   const session = getSession(sessionId);
   const post = findPost(session, postId);
   if (!post) {
-    return res.json({ succ
+    return res.json({ success: false, message: "Post not found in cache", postId });
+  }
+
+  try {
     res.json(await buildPayload(post, cleanMode));
   } catch (err) {
     console.error("get-image failed:", err.message, "post:", post.id);
@@ -1064,7 +1147,10 @@ app.post("/get-tile", async (req, res) => {
     return res.json({ success: false, message: "tx and ty required", postId });
   }
 
-  const session = getSessi
+  const session = getSession(sessionId);
+  const post = findPost(session, postId);
+  if (!post) {
+    return res.json({ success: false, message: "Post not found in cache", postId });
   }
 
   try {
@@ -1125,7 +1211,6 @@ app.post("/get-video-frames", async (req, res) => {
   }
 });
 
-// NEW: Audio endpoint for Roblox AudioStreamReader
 app.post("/get-audio-chunks", async (req, res) => {
   const { postId, startChunk = 0, sessionId } = req.body || {};
 
@@ -1142,13 +1227,14 @@ app.post("/get-audio-chunks", async (req, res) => {
   if (!post) {
     return res.json({ success: false, message: "Post not found in cache", postId });
   }
-
   if (!post.video) {
     return res.json({ success: false, message: "Post is not a video", postId: post.id });
   }
+  if (!post.meta || !post.meta.hasSound) {
+    return res.json({ success: false, message: "Video has no sound", postId: post.id });
+  }
 
-  if (!post.meta?.hasSound) {
-    return res.json({ succ
+  try {
     res.json(await buildAudioChunks(sessionId, post, from));
   } catch (err) {
     console.error("get-audio-chunks failed:", err.message, "post:", post.id, "startChunk:", from);
@@ -1169,6 +1255,9 @@ const NON_ARTIST_TAGS = new Set([
   "avoid_posting",
   "sound_warning",
   "epilepsy_warning",
+  "third-party_edit",
+  "editor_notes",
+]);
 
 const artistCache = new Map();
 
@@ -1188,7 +1277,10 @@ async function buildThumb(p) {
   const { data, info } = await sharp(buf, { animated: false })
     .ensureAlpha()
     .raw()
-    .toBuffer({ resolveWit
+    .toBuffer({ resolveWithObject: true });
+  if (info.channels !== 4 || data.length !== info.width * info.height * 4) return null;
+
+  return {
     id: p.id,
     rating: p.rating || "s",
     score: p.score && typeof p.score.total === "number" ? p.score.total : 0,
@@ -1208,7 +1300,10 @@ async function similarArtistPosts(postId, limit, ratingTokens, artist) {
       .filter(Number.isInteger);
 
     if (ids.length) {
-      const data = await e
+      const data = await e621Get("/posts.json", {
+        tags: ["id:" + ids.join(","), ...ratingTokens].join(" "),
+        limit: ids.length,
+      });
       const byId = new Map((Array.isArray(data.posts) ? data.posts : []).map((p) => [p.id, p]));
       const ordered = ids
         .map((id) => byId.get(id))
@@ -1285,7 +1380,8 @@ app.post("/artist-posts", async (req, res) => {
 
     res.json({ success: true, artist, posts: entries.map((e) => e.thumb) });
   } catch (err) {
-    console.error("artist-
+    console.error("artist-posts failed:", err.message, "post:", post.id);
+    res.json({ success: false, message: "Failed to load artist posts", postId: post.id });
   }
 });
 
@@ -1305,7 +1401,10 @@ app.post("/autocomplete-tags", async (req, res) => {
     return res.json({ success: true, suggestions: [] });
   }
 
-  const hit = acCache.get(
+  const hit = acCache.get(cleanQuery);
+  if (hit && Date.now() - hit.at < AC_TTL_MS) {
+    return res.json({ success: true, suggestions: hit.suggestions });
+  }
 
   try {
     const data = await e621Get("/tags.json", {
