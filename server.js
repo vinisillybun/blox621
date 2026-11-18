@@ -44,11 +44,17 @@ const GIF_PIXEL_LIMIT = 1000000000;
 const GIF_TTL_MS = 3 * 60 * 1000;
 const GIF_MAX_ENTRIES = 1;
 
-const VIDEO_MAX_DIMENSION = 400;
-const VIDEO_MAX_FPS = 12;
-const VIDEO_MIN_FPS = 5;
-const VIDEO_MAX_FRAMES = 360;
-const VIDEO_KEEP_BYTES = 96 * 1024 * 1024;
+// ---- video quality settings ----
+// Resolution and fps are picked per clip (see planVideo) from a memory budget and a throughput budget.
+const VIDEO_MAX_DIMENSION = 640;
+const VIDEO_MIN_DIMENSION = 320;
+const VIDEO_PREFERRED_DIMENSION = 480; // try to stay at or above this before lowering fps
+const VIDEO_FPS_LADDER = [15, 12, 10, 8];
+const VIDEO_MIN_FPS = 4;
+const VIDEO_TARGET_BPS = 8 * 1024 * 1024; // raw RGBA bytes per second of video the client can stream; lower this if playback stalls
+const VIDEO_MAX_FRAMES = 900;
+const VIDEO_KEEP_BYTES = 128 * 1024 * 1024; // lower to 96MB if your host has little RAM
+const VIDEO_ASSUMED_DURATION = 30;
 const VIDEO_FIRST_CHUNK_BYTES = 2 * 1024 * 1024;
 const VIDEO_CHUNK_BYTES = 4 * 1024 * 1024;
 const VIDEO_WAIT_MS = 15000;
@@ -612,7 +618,7 @@ function spawnFfmpeg(entry, input, maxFrames) {
     "-i", input,
     "-an",
     "-sn",
-    "-vf", `fps=${entry.fps.toFixed(3)},scale=${entry.width}:${entry.height}:flags=fast_bilinear`,
+    "-vf", `fps=${entry.fps.toFixed(3)},scale=${entry.width}:${entry.height}:flags=bicubic+accurate_rnd`,
     "-frames:v", String(maxFrames),
     "-f", "rawvideo",
     "-pix_fmt", "rgba",
@@ -756,6 +762,40 @@ function runVideo(entry, source, maxFrames) {
   });
 }
 
+const evenSize = (n) => Math.max(2, Math.round(n / 2) * 2);
+
+// Picks resolution + fps for a clip. Short clips get more pixels; long clips get a lower fps
+// instead of being cut off, always within the memory (VIDEO_KEEP_BYTES) and throughput
+// (VIDEO_TARGET_BPS) budgets.
+function planVideo(srcWidth, srcHeight, duration) {
+  const srcLongest = Math.max(srcWidth, srcHeight);
+  const cap = Math.min(1, VIDEO_MAX_DIMENSION / srcLongest);
+  const wanted = Math.min(VIDEO_PREFERRED_DIMENSION, srcLongest * cap);
+  const memDuration = duration > 0 ? duration : VIDEO_ASSUMED_DURATION;
+
+  let fps = VIDEO_FPS_LADDER[0];
+  let scale = cap;
+  for (const f of VIDEO_FPS_LADDER) {
+    const px = Math.min(
+      VIDEO_TARGET_BPS / (4 * f),
+      VIDEO_KEEP_BYTES / (4 * f * memDuration)
+    );
+    fps = f;
+    scale = Math.min(cap, Math.sqrt(px / (srcWidth * srcHeight)));
+    if (srcLongest * scale >= wanted - 0.5) break;
+  }
+  scale = Math.max(scale, Math.min(cap, VIDEO_MIN_DIMENSION / srcLongest));
+
+  const width = evenSize(srcWidth * scale);
+  const height = evenSize(srcHeight * scale);
+  const frameBytes = width * height * 4;
+  const maxFrames = Math.max(1, Math.min(VIDEO_MAX_FRAMES, Math.floor(VIDEO_KEEP_BYTES / frameBytes)));
+  if (duration > 0 && duration * fps > maxFrames) {
+    fps = Math.max(VIDEO_MIN_FPS, maxFrames / duration); // lower fps instead of cutting the clip short
+  }
+  return { width, height, frameBytes, maxFrames, fps };
+}
+
 function startVideo(post) {
   const source = post.video;
   if (!source || !source.url) throw new Error("No video available");
@@ -764,16 +804,8 @@ function startVideo(post) {
   const srcHeight = Number(source.height) || Number(post.height) || 0;
   if (!srcWidth || !srcHeight) throw new Error("Could not read video dimensions");
 
-  const scale = Math.min(1, VIDEO_MAX_DIMENSION / Math.max(srcWidth, srcHeight));
-  const width = Math.max(2, Math.round(srcWidth * scale));
-  const height = Math.max(2, Math.round(srcHeight * scale));
-  const frameBytes = width * height * 4;
-  const maxFrames = Math.max(1, Math.min(VIDEO_MAX_FRAMES, Math.floor(VIDEO_KEEP_BYTES / frameBytes)));
-
   const duration = (post.meta && post.meta.duration) || 0;
-  const fps = duration > 0
-    ? Math.min(VIDEO_MAX_FPS, Math.max(VIDEO_MIN_FPS, maxFrames / duration))
-    : VIDEO_MAX_FPS;
+  const { width, height, frameBytes, maxFrames, fps } = planVideo(srcWidth, srcHeight, duration);
   const wantAudio = !!(post.meta && post.meta.hasSound);
 
   const entry = {
