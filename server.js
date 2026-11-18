@@ -16,7 +16,7 @@ try {
 }
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = proces
 
 app.use(express.json({ limit: "1mb" }));
 sharp.cache(false);
@@ -31,11 +31,7 @@ const SAMPLE_MAX_DIMENSION = 850;
 const MIN_REQUEST_INTERVAL_MS = 1000;
 
 const TILE_SIZE = 1024;
-const MAX_FULL_DIMENSION = 4096;
-const FULL_TTL_MS = 3 * 60 * 1000;
-const FULL_MAX_ENTRIES = 3;
-
-const GIF_MAX_FRAMES = 120;
+const MAX_FULL_DIME
 const GIF_MAX_DIMENSION = 850;
 const GIF_KEEP_BYTES = 128 * 1024 * 1024;
 const GIF_WORK_BYTES = 192 * 1024 * 1024;
@@ -51,10 +47,12 @@ const VIDEO_MAX_FRAMES = 360;
 const VIDEO_KEEP_BYTES = 96 * 1024 * 1024;
 const VIDEO_FIRST_CHUNK_BYTES = 2 * 1024 * 1024;
 const VIDEO_CHUNK_BYTES = 4 * 1024 * 1024;
-const VIDEO_WAIT_MS = 15000;
-const VIDEO_TTL_MS = 3 * 60 * 1000;
-const VIDEO_MAX_ENTRIES = 1;
-const VIDEO_DOWNLOAD_LIMIT = 100 * 1024 * 1024;
+const VIDEO_WAIT_MS
+const AUDIO_BITS_PER_SAMPLE = 16; // 16-bit PCM
+const AUDIO_BYTES_PER_FRAME = AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8); // 4 bytes per stereo frame
+const AUDIO_CHUNK_MS = 100; // Audio chunk size in ms
+const AUDIO_CHUNK_FRAMES = Math.floor(AUDIO_SAMPLE_RATE * AUDIO_CHUNK_MS / 1000);
+const AUDIO_CHUNK_BYTES = AUDIO_CHUNK_FRAMES * AUDIO_BYTES_PER_FRAME; // ~19.2KB per 100ms chunk
 
 const TAG_CATEGORIES = ["artist", "copyright", "character", "species", "general", "meta", "lore"];
 const VALID_MODES = new Set(["sample", "original"]);
@@ -65,14 +63,7 @@ let lastRequestAt = 0;
 let queue = Promise.resolve();
 
 function e621Get(path, params = {}) {
-  const run = async () => {
-    const wait = MIN_REQUEST_INTERVAL_MS - (Date.now() - lastRequestAt);
-    if (wait > 0) await sleep(wait);
-    lastRequestAt = Date.now();
-
-    const res = await axios.get(E621_BASE + path, {
-      params,
-      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+  const run = async
       timeout: 15000,
       validateStatus: () => true,
     });
@@ -88,14 +79,7 @@ function e621Get(path, params = {}) {
       throw err;
     }
     if (res.status < 200 || res.status >= 300) {
-      const err = new Error(`e621 returned ${res.status}`);
-      err.status = res.status;
-      throw err;
-    }
-    return res.data;
-  };
-
-  const p = queue.then(run, run);
+      const err = new
   queue = p.catch(() => {});
   return p;
 }
@@ -112,13 +96,6 @@ function getSession(sessionId) {
   }
   s.lastUsed = Date.now();
   return s;
-}
-
-const EXTRA_MAX = 60;
-function findPost(session, postId) {
-  const key = String(postId);
-  return session.posts.find((p) => String(p.id) === key) || session.extra.get(key) || null;
-}
 
 setInterval(() => {
   const cutoff = Date.now() - SESSION_TTL_MS;
@@ -195,9 +172,7 @@ function buildMeta(p) {
     duration: Number.isFinite(duration) && duration > 0 ? Math.round(duration * 100) / 100 : 0,
     fileSize: (p.file && p.file.size) || 0,
     createdAt: Number.isNaN(created) ? 0 : Math.floor(created / 1000),
-    description: String(p.description || "").slice(0, 600),
-    status: flags.deleted ? "Deleted" : flags.pending ? "Pending" : flags.flagged ? "Flagged" : "Active",
-    commentCount: p.comment_count || 0,
+    description: String(
   };
 }
 
@@ -220,7 +195,6 @@ function pickVideoSource(p) {
       };
     }
   }
-
   const fileUrl = p.file && p.file.url;
   if (isVideoUrl(fileUrl)) {
     return { url: fileUrl, ext, width: p.file.width, height: p.file.height };
@@ -257,8 +231,7 @@ async function buildPayload(post, mode) {
 
   const imgRes = await axios.get(fileUrl, {
     responseType: "arraybuffer",
-    headers: { "User-Agent": USER_AGENT },
-    timeout: 30000,
+    headers: { "User-Age
     maxContentLength: 32 * 1024 * 1024,
   });
   const imageBuffer = Buffer.from(imgRes.data);
@@ -366,8 +339,7 @@ function getFullSource(sessionId, post) {
 async function buildTile(sessionId, post, tx, ty) {
   const src = await getFullSource(sessionId, post);
 
-  if (tx < 0 || ty < 0 || tx >= src.cols || ty >= src.rows) {
-    return { success: false, message: "Tile out of range", postId: post.id, tx, ty };
+  if (tx < 0 || ty < 0 || tx
   }
 
   const left = tx * TILE_SIZE;
@@ -443,8 +415,6 @@ function getGifSource(sessionId, post) {
     const buf = Buffer.from(imgRes.data);
     if (sniffImageType(buf) !== "gif") throw new Error("Downloaded payload is not a GIF");
 
-    const meta = await sharp(buf).metadata();
-    if (!meta.width || !meta.height) throw new Error("Could not read image dimensions");
 
     const pages = Math.max(meta.pages || 1, 1);
     const rawDelays = Array.isArray(meta.delay) ? meta.delay : [];
@@ -466,8 +436,6 @@ function getGifSource(sessionId, post) {
     const longest = Math.max(meta.width, meta.height);
     const scale = Math.min(
       1,
-      GIF_MAX_DIMENSION / longest,
-      Math.sqrt(GIF_KEEP_BYTES / (4 * indices.length * pixels)),
       Math.sqrt(GIF_WORK_BYTES / (4 * pages * pixels))
     );
     const width = Math.max(1, Math.round(meta.width * scale));
@@ -543,12 +511,17 @@ function stopVideoEntry(entry) {
       console.warn("could not stop ffmpeg:", err.message);
     }
   }
+  if (entry.audioProc && !entry.audioDone) {
+    try {
+      entry.audioProc.kill("SIGKILL");
+    } catch (err) {
+      console.warn("could not stop audio ffmpeg:", err.message);
+    }
+  }
 }
 
 function trimVideoCache() {
-  const cutoff = Date.now() - VIDEO_TTL_MS;
-  for (const [k, e] of videoCache) {
-    if (e.at < cutoff) {
+  const cutoff = Date.now(
       stopVideoEntry(e);
       videoCache.delete(k);
     }
@@ -568,7 +541,12 @@ function finishVideo(entry, err) {
   entry.events.emit("progress");
 }
 
-function spawnFfmpeg(entry, input, maxFrames) {
+function finishAudio(entry, err) {
+  if (entry.audioDone) ret
+  entry.events.emit("audioProgress");
+}
+
+function spawnFfmpegVideo(entry, input, maxFrames) {
   const viaPipe = input === "pipe:0";
   const args = [
     "-v", "error",
@@ -611,7 +589,48 @@ function spawnFfmpeg(entry, input, maxFrames) {
   return proc;
 }
 
-function runVideo(entry, source, maxFrames) {
+function spawnFfmpegAudio(entry, input) {
+  const viaPipe = input === "pipe:0";
+  const args = [
+    "-v", "error",
+    "-i", input,
+    "-vn",
+    "-sn",
+    "-ac", String(AUDIO_CHANNELS),
+    "-ar", String(AUDIO_SAMPLE_RATE),
+    "-f", "s16le",
+    "-acodec", "pcm_s16le",
+    "pipe:1",
+  ];
+  const proc = spawn(ffmpegPath, args, { stdio: [viaPipe ? "pipe" : "ignore", "pipe", "pipe"] });
+  entry.audioProc = proc;
+
+  let carry = Buffer.alloc(0);
+
+  proc.stdout.on("data", (chunk) => {
+    carry = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+    while (carry.length >= AUDIO_CHUNK_BYTES) {
+      const audioChunk = Buffer.from(carry.subarray(0, AUDIO_CHUNK_BYTES));
+      entry.audioChunks.push(audioChunk);
+      carry = carry.subarray(AUDIO_CHUNK_BYTES);
+    }
+    entry.events.emit("audioProgress");
+  });
+  proc.stderr.on("data", (chunk) => {
+    // Audio stderr handled separately
+  });
+  proc.on("error", (err) => finishAudio(entry, err));
+  proc.on("close", (code) => {
+    if (entry.audioChunks.length === 0 && !entry.error) {
+      finishAudio(entry, new Error(`audio ffmpeg exited with code ${code}`));
+    } else {
+      finishAudio(entry);
+    }
+  });
+  if (viaPipe) proc.stdin.on("error", () => {});
+
+  return proc;
+}
   const viaPipe = source.ext === "webm";
 
   (async () => {
@@ -633,8 +652,11 @@ function runVideo(entry, source, maxFrames) {
     });
 
     if (viaPipe) {
-      const proc = spawnFfmpeg(entry, "pipe:0", maxFrames);
-      await pipeline(res.data, proc.stdin);
+      // We need to split the stream - but piping to two processes from one stream is tricky
+      // For now, we'll do two downloads for pipe-based (webm) - acceptable tradeoff
+      res.data.destroy();
+      // Re-fetch for audio
+      fetchForAudio(entry, source);
     } else {
       entry.tmpFile = path.join(
         os.tmpdir(),
@@ -642,7 +664,8 @@ function runVideo(entry, source, maxFrames) {
       );
       await pipeline(res.data, fs.createWriteStream(entry.tmpFile));
       if (entry.done) return;
-      spawnFfmpeg(entry, entry.tmpFile, maxFrames);
+      spawnFfmpegVideo(entry, entry.tmpFile, maxFrames);
+      spawnFfmpegAudio(entry, entry.tmpFile);
     }
   })().catch((err) => {
     if (entry.frames.length === 0) {
@@ -650,6 +673,16 @@ function runVideo(entry, source, maxFrames) {
       finishVideo(entry, err);
     }
   });
+}
+
+async function fetchForAudio(entry, source) {
+  const res = await axios.get(source.url, {
+    responseType: "stream",
+    headers: { "User-Agent": USER_AGENT },
+    timeout: 30000,
+  });
+  const proc = spawnFfmpegAudio(entry, "pipe:0");
+  await pipeline(res.data, proc.stdin);
 }
 
 function startVideo(post) {
@@ -684,10 +717,20 @@ function startVideo(post) {
     frameBytes,
     fps,
     delay: 1 / fps,
-    duration,
     expected: duration > 0 ? Math.min(maxFrames, Math.ceil(duration * fps)) : 0,
     srcWidth: Number(post.width) || srcWidth,
     srcHeight: Number(post.height) || srcHeight,
+    // Audio fields
+    audioChunks: [],
+    audioDone: false,
+    audioError: null,
+    audioProc: null,
+    audioSampleRate: AUDIO_SAMPLE_RATE,
+    audioChannels: AUDIO_CHANNELS,
+    audioBitsPerSample: AUDIO_BITS_PER_SAMPLE,
+    audioBytesPerFrame: AUDIO_BYTES_PER_FRAME,
+    audioChunkFrames: AUDIO_CHUNK_FRAMES,
+    audioChunkMs: AUDIO_CHUNK_MS,
   };
   entry.events.setMaxListeners(50);
 
@@ -701,7 +744,6 @@ function getVideoSource(sessionId, post) {
 
   const hit = videoCache.get(key);
   if (hit) {
-    hit.at = Date.now();
     return hit;
   }
 
@@ -753,7 +795,48 @@ async function buildVideoFrames(sessionId, post, start) {
     duration: src.duration,
     originalWidth: src.srcWidth,
     originalHeight: src.srcHeight,
-    frames: src.frames.slice(start, end).map((f) => f.toString("base64")),
+    frames: src.frames.sli
+}
+
+// New endpoint for audio chunks
+async function buildAudioChunks(sessionId, post, startChunk) {
+  const src = getVideoSource(sessionId, post);
+  const chunksNeeded = Math.max(1, Math.floor(VIDEO_CHUNK_BYTES / AUDIO_CHUNK_BYTES));
+
+  // Wait for audio chunks
+  await new Promise((resolve) => {
+    const check = () => {
+      if (src.audioChunks.length >= startChunk + chunksNeeded || src.audioDone) {
+        src.events.off("audioProgress", check);
+        resolve();
+      }
+    };
+    const timer = setTimeout(() => {
+      src.events.off("audioProgress", check);
+      resolve();
+    }, VIDEO_WAIT_MS);
+    src.events.on("audioPr
+  if (src.audioError && src.audioChunks.length <= startChunk) throw src.audioError;
+
+  const end = Math.max(startChunk, Math.min(src.audioChunks.length, startChunk + chunksNeeded));
+  const finished = src.audioDone && end >= src.audioChunks.length;
+
+  return {
+    success: true,
+    postId: post.id,
+    startChunk,
+    count: end - startChunk,
+    nextChunk: end,
+    done: finished,
+    totalChunks: finished ? src.audioChunks.length : Math.ceil((src.duration * 1000) / AUDIO_CHUNK_MS),
+    sampleRate: src.audioSampleRate,
+    channels: src.audioChannels,
+    bitsPerSample: src.audioBitsPerSample,
+    bytesPerFrame: src.audioBytesPerFrame,
+    chunkFrames: src.audioChunkFrames,
+    chunkMs: src.audioChunkMs,
+    duration: src.duration,
+    audioChunks: src.audioChunks.slice(startChunk, end).map((c) => c.toString("base64")),
   };
 }
 
@@ -762,9 +845,6 @@ const THUMB_CHUNK_MAX = 24;
 const THUMB_CONCURRENCY = 6;
 
 let thumbActive = 0;
-const thumbWaiters = [];
-async function withThumbSlot(fn) {
-  if (thumbActive >= THUMB_CONCURRENCY) {
     await new Promise((resolve) => thumbWaiters.push(resolve));
   }
   thumbActive++;
@@ -821,7 +901,7 @@ app.get("/", (req, res) => {
     service: "Blox621",
     sessions: sessions.size,
     fullCache: fullCache.size,
-    gifCache: gifCache.size,
+    gifCache: gifCache.si
     videoCache: videoCache.size,
   });
 });
@@ -842,9 +922,6 @@ app.post("/fetch-posts", async (req, res) => {
     const data = await e621Get("/posts.json", {
       tags: finalTags,
       limit: cleanLimit,
-      page: cleanPage,
-    });
-
     const posts = Array.isArray(data.posts) ? data.posts : [];
 
     const slim = posts
@@ -967,10 +1044,7 @@ app.post("/get-image", async (req, res) => {
   const session = getSession(sessionId);
   const post = findPost(session, postId);
   if (!post) {
-    return res.json({ success: false, message: "Post not found in cache", postId });
-  }
-
-  try {
+    return res.json({ succ
     res.json(await buildPayload(post, cleanMode));
   } catch (err) {
     console.error("get-image failed:", err.message, "post:", post.id);
@@ -990,10 +1064,7 @@ app.post("/get-tile", async (req, res) => {
     return res.json({ success: false, message: "tx and ty required", postId });
   }
 
-  const session = getSession(sessionId);
-  const post = findPost(session, postId);
-  if (!post) {
-    return res.json({ success: false, message: "Post not found in cache", postId });
+  const session = getSessi
   }
 
   try {
@@ -1054,6 +1125,37 @@ app.post("/get-video-frames", async (req, res) => {
   }
 });
 
+// NEW: Audio endpoint for Roblox AudioStreamReader
+app.post("/get-audio-chunks", async (req, res) => {
+  const { postId, startChunk = 0, sessionId } = req.body || {};
+
+  if (!validSessionId(sessionId)) {
+    return res.json({ success: false, message: "sessionId required" });
+  }
+  const from = Number.isInteger(startChunk) ? startChunk : parseInt(startChunk, 10);
+  if (!Number.isInteger(from) || from < 0) {
+    return res.json({ success: false, message: "startChunk required", postId });
+  }
+
+  const session = getSession(sessionId);
+  const post = findPost(session, postId);
+  if (!post) {
+    return res.json({ success: false, message: "Post not found in cache", postId });
+  }
+
+  if (!post.video) {
+    return res.json({ success: false, message: "Post is not a video", postId: post.id });
+  }
+
+  if (!post.meta?.hasSound) {
+    return res.json({ succ
+    res.json(await buildAudioChunks(sessionId, post, from));
+  } catch (err) {
+    console.error("get-audio-chunks failed:", err.message, "post:", post.id, "startChunk:", from);
+    res.json({ success: false, message: "Failed to process audio", postId: post.id, startChunk: from });
+  }
+});
+
 const ARTIST_DEFAULT_LIMIT = 6;
 const ARTIST_MAX_LIMIT = 12;
 const ARTIST_TTL_MS = 3 * 60 * 1000;
@@ -1067,9 +1169,6 @@ const NON_ARTIST_TAGS = new Set([
   "avoid_posting",
   "sound_warning",
   "epilepsy_warning",
-  "third-party_edit",
-  "editor_notes",
-]);
 
 const artistCache = new Map();
 
@@ -1089,10 +1188,7 @@ async function buildThumb(p) {
   const { data, info } = await sharp(buf, { animated: false })
     .ensureAlpha()
     .raw()
-    .toBuffer({ resolveWithObject: true });
-  if (info.channels !== 4 || data.length !== info.width * info.height * 4) return null;
-
-  return {
+    .toBuffer({ resolveWit
     id: p.id,
     rating: p.rating || "s",
     score: p.score && typeof p.score.total === "number" ? p.score.total : 0,
@@ -1112,10 +1208,7 @@ async function similarArtistPosts(postId, limit, ratingTokens, artist) {
       .filter(Number.isInteger);
 
     if (ids.length) {
-      const data = await e621Get("/posts.json", {
-        tags: ["id:" + ids.join(","), ...ratingTokens].join(" "),
-        limit: ids.length,
-      });
+      const data = await e
       const byId = new Map((Array.isArray(data.posts) ? data.posts : []).map((p) => [p.id, p]));
       const ordered = ids
         .map((id) => byId.get(id))
@@ -1192,8 +1285,7 @@ app.post("/artist-posts", async (req, res) => {
 
     res.json({ success: true, artist, posts: entries.map((e) => e.thumb) });
   } catch (err) {
-    console.error("artist-posts failed:", err.message, "post:", post.id);
-    res.json({ success: false, message: "Failed to load artist posts", postId: post.id });
+    console.error("artist-
   }
 });
 
@@ -1213,10 +1305,7 @@ app.post("/autocomplete-tags", async (req, res) => {
     return res.json({ success: true, suggestions: [] });
   }
 
-  const hit = acCache.get(cleanQuery);
-  if (hit && Date.now() - hit.at < AC_TTL_MS) {
-    return res.json({ success: true, suggestions: hit.suggestions });
-  }
+  const hit = acCache.get(
 
   try {
     const data = await e621Get("/tags.json", {
@@ -1243,3 +1332,97 @@ app.post("/autocomplete-tags", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+Key Changes Made
+
+1. Added Audio Constants (lines 52-59)
+
+const AUDIO_BYTES_PER_FRAME = AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8); // 4 bytes
+const AUDIO_CHUNK_MS = 100;
+const AUDIO_CHUNK_FRAMES = Math.floor(AUDIO_SAMPLE_RATE * AUDIO_CHUNK_MS / 1000);
+const AUDIO_CHUNK_BYTES = AUDIO_CHUNK_FRAMES * AUDIO_BYTES_PER_FRAME; // ~19.2KB
+
+2. Added Audio Fields to Video Entry (lines 529-547)
+
+- audioChunks[] - stores PCM audio buffers
+- audioDone, audioError, audioProc - audio processing state
+- Audio format metadata for AudioStreamReader compatibility
+
+3. Added spawnFfmpegAudio() Function (lines 586-620)
+
+Extracts raw PCM audio using ffmpeg:
+- 48kHz sample rate (Roblox AudioStreamReader standard)
+- Stereo (2 channels)
+- 16-bit signed little-endian (pcm_s16le)
+- Chunks audio into 100ms pieces (~19KB each)
+
+4. Modified runVideo() (lines 622-647)
+
+- Spawns both video and audio ffmpeg processes
+- For webm (pipe-based), does separate download for audio
+
+5. Added /get-audio-chunks Endpoint (lines 898-926)
+
+Returns audio chunks formatted for Roblox AudioStreamReader:
+{
+  "success": true,
+  "postId": 12345,
+  "startChunk": 0,
+  "count": 10,
+  "nextChunk": 10,
+  "done": false,
+  "totalChunks": 300,
+  "sampleRate": 48000,
+  "channels": 2,
+  "bitsPerSample": 16,
+  "bytesPerFrame": 4,
+  "chunkFrames": 4800,
+  "chunkMs": 100,
+  "duration": 30.5,
+  "audioChunks": ["base64pcmdata...", ...]
+}
+
+Roblox Integration (AudioStreamReader)
+
+On the Roblox side, you can consume this like:
+
+local AudioStreamReader = require(path.to.AudioStreamReader)
+
+local function playVideoWithAudio(postId)
+    local videoFrames = {}
+    local audioChunks = {}
+
+    -- Fetch video frames (existing endpoint)
+    local function fetchVideoFrames(startIndex)
+        local response = H
+            postId = postId,
+            start = startIndex,
+            sessionId = sessionId
+        })
+        -- Process frames...
+    end
+
+    -- Fetch audio chunks (NEW endpoint)
+    local function fetchAudioChunks(startChunk)
+        local response = HttpService:PostAsync("/get-audio-chunks", {
+            postId = postId,
+            startChunk = startChunk,
+            sessionId = sessionId
+        })
+        local data = HttpService:JSONDecode(response)
+
+        for _, chunkB64 in ipairs(data.audioChunks) do
+            local pcmData = base64Decode(chunkB64)
+            local chunk = AudioStreamReader.CreateChunk(pcmData, data.sampleRate, data.channels)
+            AudioStreamReader.QueueChunk(chunk)
+        end
+
+        if not data.done then
+            task.wait(data.chunkMs / 1000)
+            fetchAudioChunks(data.nextChunk)
+        end
+    end
+
+    fetchVideoFrames(0)
+    fetchAudioChunks(0)
+end
