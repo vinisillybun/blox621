@@ -1,30 +1,40 @@
 const express = require("express");
 const axios = require("axios");
 const sharp = require("sharp");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawn } = require("child_process");
+const { EventEmitter } = require("events");
+const { pipeline } = require("stream/promises");
+
+let ffmpegPath = "ffmpeg";
+try {
+  ffmpegPath = require("ffmpeg-static") || "ffmpeg";
+} catch (err) {
+  console.warn("ffmpeg-static is not installed, falling back to ffmpeg from PATH");
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "1mb" }));
-sharp.cache(false); // don't keep decoded originals in sharp's internal cache
+sharp.cache(false);
 
-// --- e621 config -----------------------------------------------------------
 const USER_AGENT = "Blox621/1.0 (Roblox experience; contact: your_email@example.com)";
 const E621_BASE = "https://e621.net";
-const MAX_EDITABLE_DIMENSION = 1024; // Roblox EditableImage limit for ONE image (caps "original")
+const MAX_EDITABLE_DIMENSION = 1024;
 const DEFAULT_LIMIT = 30;
 const MAX_LIMIT = 320;
 
-const SAMPLE_MAX_DIMENSION = 850; // "longest side capped at 850"
+const SAMPLE_MAX_DIMENSION = 850;
 const MIN_REQUEST_INTERVAL_MS = 1000;
 
-// --- tiled full-resolution config ------------------------------------------
-const TILE_SIZE = 1024; // one tile = one EditableImage on the client
-const MAX_FULL_DIMENSION = 4096; // longest side of the stitched image (4096 -> up to 16 tiles, ~64 MB of textures)
-const FULL_TTL_MS = 3 * 60 * 1000; // how long a downloaded original is kept for tile requests
-const FULL_MAX_ENTRIES = 3; // encoded originals kept in memory (each up to 32 MB)
+const TILE_SIZE = 1024;
+const MAX_FULL_DIMENSION = 4096;
+const FULL_TTL_MS = 3 * 60 * 1000;
+const FULL_MAX_ENTRIES = 3;
 
-// --- gif config ------------------------------------------------------------
 const GIF_MAX_FRAMES = 120;
 const GIF_MAX_DIMENSION = 850;
 const GIF_KEEP_BYTES = 128 * 1024 * 1024;
@@ -34,14 +44,23 @@ const GIF_PIXEL_LIMIT = 1000000000;
 const GIF_TTL_MS = 3 * 60 * 1000;
 const GIF_MAX_ENTRIES = 1;
 
+const VIDEO_MAX_DIMENSION = 400;
+const VIDEO_MAX_FPS = 12;
+const VIDEO_MIN_FPS = 5;
+const VIDEO_MAX_FRAMES = 360;
+const VIDEO_KEEP_BYTES = 96 * 1024 * 1024;
+const VIDEO_FIRST_CHUNK_BYTES = 2 * 1024 * 1024;
+const VIDEO_CHUNK_BYTES = 4 * 1024 * 1024;
+const VIDEO_WAIT_MS = 15000;
+const VIDEO_TTL_MS = 3 * 60 * 1000;
+const VIDEO_MAX_ENTRIES = 1;
+const VIDEO_DOWNLOAD_LIMIT = 100 * 1024 * 1024;
+
 const TAG_CATEGORIES = ["artist", "copyright", "character", "species", "general", "meta", "lore"];
 const VALID_MODES = new Set(["sample", "original"]);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// --- e621 request queue ----------------------------------------------------
-// Every e621 API call goes through one promise chain so concurrent requests are
-// spaced MIN_REQUEST_INTERVAL_MS apart.
 let lastRequestAt = 0;
 let queue = Promise.resolve();
 
@@ -81,10 +100,8 @@ function e621Get(path, params = {}) {
   return p;
 }
 
-// --- per-session in-memory state -------------------------------------------
-const SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const SESSION_TTL_MS = 10 * 60 * 1000;
 
-/** @type {Map<string, {posts: any[], extra: Map<string, any>, cursor: number, tags: string, lastUsed: number}>} */
 const sessions = new Map();
 
 function getSession(sessionId) {
@@ -97,7 +114,6 @@ function getSession(sessionId) {
   return s;
 }
 
-// A post from the search results, or one opened from the "From the Artist" panel.
 const EXTRA_MAX = 60;
 function findPost(session, postId) {
   const key = String(postId);
@@ -111,12 +127,15 @@ setInterval(() => {
   }
 }, 60 * 1000).unref?.();
 
-// --- helpers ---------------------------------------------------------------
-
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp)(\?|$)/i;
+const VIDEO_EXT_RE = /\.(mp4|webm)(\?|$)/i;
 
 function isSupportedUrl(url) {
   return typeof url === "string" && IMAGE_EXT_RE.test(url);
+}
+
+function isVideoUrl(url) {
+  return typeof url === "string" && VIDEO_EXT_RE.test(url);
 }
 
 function validSessionId(id) {
@@ -133,11 +152,6 @@ function sniffImageType(buf) {
   return null;
 }
 
-/**
- * Target (width, height) for a mode:
- *  - "sample":   longest side capped at SAMPLE_MAX_DIMENSION
- *  - "original": full size, but always capped at MAX_EDITABLE_DIMENSION
- */
 function computeTargetSize(originalWidth, originalHeight, mode) {
   let scale = 1;
   const longest = Math.max(originalWidth, originalHeight);
@@ -159,7 +173,6 @@ function computeTargetSize(originalWidth, originalHeight, mode) {
   return { targetWidth, targetHeight };
 }
 
-/** Small, JSON-safe slice of an e621 post that the Roblox UI shows in its sidebar. */
 function buildMeta(p) {
   const tags = {};
   for (const c of TAG_CATEGORIES) {
@@ -167,7 +180,8 @@ function buildMeta(p) {
   }
   const flags = p.flags || {};
   const created = p.created_at ? Date.parse(p.created_at) : NaN;
-  const ext = (p.file && p.file.ext) || "";
+  const ext = String((p.file && p.file.ext) || "").toLowerCase();
+  const isVideo = ext === "mp4" || ext === "webm";
   const duration = Number(p.duration);
   return {
     tags,
@@ -176,22 +190,51 @@ function buildMeta(p) {
     favCount: p.fav_count || 0,
     ext,
     animated: ext === "gif",
+    video: isVideo,
+    hasSound: isVideo && tags.meta.includes("sound"),
     duration: Number.isFinite(duration) && duration > 0 ? Math.round(duration * 100) / 100 : 0,
     fileSize: (p.file && p.file.size) || 0,
-    createdAt: Number.isNaN(created) ? 0 : Math.floor(created / 1000), // unix seconds
+    createdAt: Number.isNaN(created) ? 0 : Math.floor(created / 1000),
     description: String(p.description || "").slice(0, 600),
     status: flags.deleted ? "Deleted" : flags.pending ? "Pending" : flags.flagged ? "Flagged" : "Active",
     commentCount: p.comment_count || 0,
   };
 }
 
-/** Slim post shape cached per session (search results and artist posts share it). */
+function pickVideoSource(p) {
+  const ext = String((p.file && p.file.ext) || "").toLowerCase();
+  if (ext !== "mp4" && ext !== "webm") return null;
+
+  const alternates = (p.sample && p.sample.alternates) || {};
+  for (const key of ["480p", "720p"]) {
+    const alt = alternates[key];
+    if (!alt) continue;
+    const urls = [alt.url, ...(Array.isArray(alt.urls) ? alt.urls : [])].filter(isVideoUrl);
+    const url = urls.find((u) => /\.webm(\?|$)/i.test(u)) || urls[0];
+    if (url) {
+      return {
+        url,
+        ext: url.match(VIDEO_EXT_RE)[1].toLowerCase(),
+        width: alt.width,
+        height: alt.height,
+      };
+    }
+  }
+
+  const fileUrl = p.file && p.file.url;
+  if (isVideoUrl(fileUrl)) {
+    return { url: fileUrl, ext, width: p.file.width, height: p.file.height };
+  }
+  return null;
+}
+
 function slimPost(p) {
   return {
     id: p.id,
     previewUrl: p.preview && p.preview.url ? p.preview.url : null,
     sampleUrl: p.sample && p.sample.url ? p.sample.url : null,
     fileUrl: p.file && p.file.url ? p.file.url : null,
+    video: pickVideoSource(p),
     width: p.file ? p.file.width : null,
     height: p.file ? p.file.height : null,
     rating: p.rating,
@@ -199,11 +242,6 @@ function slimPost(p) {
   };
 }
 
-/**
- * Download one post's image and return the Roblox payload (raw RGBA as base64).
- * mode "original" falls back to the sample if the original isn't a static image.
- * Nothing is cached here: RGBA payloads are several MB each.
- */
 async function buildPayload(post, mode) {
   const wantOriginal = mode === "original" && isSupportedUrl(post.fileUrl);
   const fileUrl = wantOriginal
@@ -225,7 +263,6 @@ async function buildPayload(post, mode) {
   });
   const imageBuffer = Buffer.from(imgRes.data);
 
-  // e621 sometimes returns HTML error pages or non-static formats.
   if (!sniffImageType(imageBuffer)) {
     return { success: false, message: "Downloaded payload is not a supported image", postId: post.id };
   }
@@ -237,10 +274,8 @@ async function buildPayload(post, mode) {
     return { success: false, message: "Could not read image dimensions", postId: post.id };
   }
 
-  // Resize from the dimensions of the file we actually downloaded.
   const { targetWidth, targetHeight } = computeTargetSize(metadata.width, metadata.height, usedMode);
 
-  // For animated GIFs/WebPs, take the first frame only.
   const { data, info } = await sharp(imageBuffer, { animated: false })
     .ensureAlpha()
     .resize(targetWidth, targetHeight, { fit: "fill" })
@@ -259,7 +294,7 @@ async function buildPayload(post, mode) {
     pixelData: data.toString("base64"),
     width: info.width,
     height: info.height,
-    originalWidth, // true size of the e621 original, even if the texture is capped
+    originalWidth,
     originalHeight,
     postId: post.id,
     mode: usedMode,
@@ -267,13 +302,6 @@ async function buildPayload(post, mode) {
   };
 }
 
-// --- tiled full-resolution images ------------------------------------------
-// A Roblox EditableImage is limited to 1024x1024, so a bigger picture is sent as
-// a grid of TILE_SIZE tiles that the client stitches together. The downloaded
-// original is kept briefly (encoded, a few MB) so the tile requests for one post
-// don't each re-download it.
-
-/** @type {Map<string, {at: number, promise: Promise<any>}>} */
 const fullCache = new Map();
 
 function trimFullCache() {
@@ -347,8 +375,6 @@ async function buildTile(sessionId, post, tx, ty) {
   const width = Math.min(TILE_SIZE, src.fullWidth - left);
   const height = Math.min(TILE_SIZE, src.fullHeight - top);
 
-  // resize() before extract() makes sharp crop AFTER resizing, so the tile
-  // comes out of the already-scaled (<= MAX_FULL_DIMENSION) image.
   let img = sharp(src.buf, { animated: false });
   if (src.fullWidth !== src.srcWidth || src.fullHeight !== src.srcHeight) {
     img = img.resize(src.fullWidth, src.fullHeight, { fit: "fill" });
@@ -371,11 +397,11 @@ async function buildTile(sessionId, post, tx, ty) {
     ty,
     cols: src.cols,
     rows: src.rows,
-    x: left, // tile position inside the stitched image, in pixels
+    x: left,
     y: top,
     width: info.width,
     height: info.height,
-    fullWidth: src.fullWidth, // size of the stitched image
+    fullWidth: src.fullWidth,
     fullHeight: src.fullHeight,
     originalWidth: src.srcWidth,
     originalHeight: src.srcHeight,
@@ -383,8 +409,6 @@ async function buildTile(sessionId, post, tx, ty) {
   };
 }
 
-// --- animated gif frames -----------------------------------------------------
-/** @type {Map<string, {at: number, promise: Promise<any>}>} */
 const gifCache = new Map();
 
 function trimGifCache() {
@@ -509,12 +533,234 @@ async function buildGifFrames(sessionId, post, start) {
   };
 }
 
-// --- grid thumbnails ---------------------------------------------------------
-const THUMB_MAX_DIMENSION = 150;
-const THUMB_CHUNK_MAX = 24; // hard cap per request
-const THUMB_CONCURRENCY = 6; // simultaneous downloads from static1.e621.net
+const videoCache = new Map();
 
-/** Small pool so a 320-post page never opens hundreds of sockets at once. */
+function stopVideoEntry(entry) {
+  if (entry.proc && !entry.done) {
+    try {
+      entry.proc.kill("SIGKILL");
+    } catch (err) {
+      console.warn("could not stop ffmpeg:", err.message);
+    }
+  }
+}
+
+function trimVideoCache() {
+  const cutoff = Date.now() - VIDEO_TTL_MS;
+  for (const [k, e] of videoCache) {
+    if (e.at < cutoff) {
+      stopVideoEntry(e);
+      videoCache.delete(k);
+    }
+  }
+  while (videoCache.size > VIDEO_MAX_ENTRIES) {
+    const oldestKey = videoCache.keys().next().value;
+    stopVideoEntry(videoCache.get(oldestKey));
+    videoCache.delete(oldestKey);
+  }
+}
+
+function finishVideo(entry, err) {
+  if (entry.done) return;
+  if (err) entry.error = err;
+  entry.done = true;
+  if (entry.tmpFile) fs.unlink(entry.tmpFile, () => {});
+  entry.events.emit("progress");
+}
+
+function spawnFfmpeg(entry, input, maxFrames) {
+  const viaPipe = input === "pipe:0";
+  const args = [
+    "-v", "error",
+    "-i", input,
+    "-an",
+    "-sn",
+    "-vf", `fps=${entry.fps.toFixed(3)},scale=${entry.width}:${entry.height}:flags=fast_bilinear`,
+    "-frames:v", String(maxFrames),
+    "-f", "rawvideo",
+    "-pix_fmt", "rgba",
+    "pipe:1",
+  ];
+  const proc = spawn(ffmpegPath, args, { stdio: [viaPipe ? "pipe" : "ignore", "pipe", "pipe"] });
+  entry.proc = proc;
+
+  let carry = Buffer.alloc(0);
+  let stderr = "";
+
+  proc.stdout.on("data", (chunk) => {
+    carry = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+    while (carry.length >= entry.frameBytes && entry.frames.length < maxFrames) {
+      entry.frames.push(Buffer.from(carry.subarray(0, entry.frameBytes)));
+      carry = carry.subarray(entry.frameBytes);
+    }
+    entry.events.emit("progress");
+  });
+  proc.stderr.on("data", (chunk) => {
+    if (stderr.length < 4000) stderr += chunk.toString();
+  });
+  proc.on("error", (err) => finishVideo(entry, err));
+  proc.on("close", (code) => {
+    if (entry.frames.length === 0) {
+      finishVideo(entry, new Error(stderr.trim().slice(-300) || `ffmpeg exited with code ${code}`));
+    } else {
+      finishVideo(entry);
+    }
+  });
+  if (viaPipe) proc.stdin.on("error", () => {});
+
+  return proc;
+}
+
+function runVideo(entry, source, maxFrames) {
+  const viaPipe = source.ext === "webm";
+
+  (async () => {
+    const res = await axios.get(source.url, {
+      responseType: "stream",
+      headers: { "User-Agent": USER_AGENT },
+      timeout: 30000,
+    });
+
+    if (entry.done) {
+      res.data.destroy();
+      return;
+    }
+
+    let received = 0;
+    res.data.on("data", (chunk) => {
+      received += chunk.length;
+      if (received > VIDEO_DOWNLOAD_LIMIT) res.data.destroy(new Error("Video is too large"));
+    });
+
+    if (viaPipe) {
+      const proc = spawnFfmpeg(entry, "pipe:0", maxFrames);
+      await pipeline(res.data, proc.stdin);
+    } else {
+      entry.tmpFile = path.join(
+        os.tmpdir(),
+        `blox621-${Date.now()}-${Math.random().toString(36).slice(2)}.${source.ext}`
+      );
+      await pipeline(res.data, fs.createWriteStream(entry.tmpFile));
+      if (entry.done) return;
+      spawnFfmpeg(entry, entry.tmpFile, maxFrames);
+    }
+  })().catch((err) => {
+    if (entry.frames.length === 0) {
+      stopVideoEntry(entry);
+      finishVideo(entry, err);
+    }
+  });
+}
+
+function startVideo(post) {
+  const source = post.video;
+  if (!source || !source.url) throw new Error("No video available");
+
+  const srcWidth = Number(source.width) || Number(post.width) || 0;
+  const srcHeight = Number(source.height) || Number(post.height) || 0;
+  if (!srcWidth || !srcHeight) throw new Error("Could not read video dimensions");
+
+  const scale = Math.min(1, VIDEO_MAX_DIMENSION / Math.max(srcWidth, srcHeight));
+  const width = Math.max(2, Math.round(srcWidth * scale));
+  const height = Math.max(2, Math.round(srcHeight * scale));
+  const frameBytes = width * height * 4;
+  const maxFrames = Math.max(1, Math.min(VIDEO_MAX_FRAMES, Math.floor(VIDEO_KEEP_BYTES / frameBytes)));
+
+  const duration = (post.meta && post.meta.duration) || 0;
+  const fps = duration > 0
+    ? Math.min(VIDEO_MAX_FPS, Math.max(VIDEO_MIN_FPS, maxFrames / duration))
+    : VIDEO_MAX_FPS;
+
+  const entry = {
+    at: Date.now(),
+    frames: [],
+    done: false,
+    error: null,
+    proc: null,
+    tmpFile: null,
+    events: new EventEmitter(),
+    width,
+    height,
+    frameBytes,
+    fps,
+    delay: 1 / fps,
+    duration,
+    expected: duration > 0 ? Math.min(maxFrames, Math.ceil(duration * fps)) : 0,
+    srcWidth: Number(post.width) || srcWidth,
+    srcHeight: Number(post.height) || srcHeight,
+  };
+  entry.events.setMaxListeners(50);
+
+  runVideo(entry, source, maxFrames);
+  return entry;
+}
+
+function getVideoSource(sessionId, post) {
+  const key = `${sessionId}:${post.id}`;
+  trimVideoCache();
+
+  const hit = videoCache.get(key);
+  if (hit) {
+    hit.at = Date.now();
+    return hit;
+  }
+
+  const entry = startVideo(post);
+  videoCache.set(key, entry);
+  return entry;
+}
+
+function waitForFrames(src, need) {
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      src.events.off("progress", check);
+      resolve();
+    };
+    const check = () => {
+      if (src.frames.length >= need || src.done) finish();
+    };
+    const timer = setTimeout(finish, VIDEO_WAIT_MS);
+    src.events.on("progress", check);
+    check();
+  });
+}
+
+async function buildVideoFrames(sessionId, post, start) {
+  const src = getVideoSource(sessionId, post);
+  const budget = start === 0 ? VIDEO_FIRST_CHUNK_BYTES : VIDEO_CHUNK_BYTES;
+  const perChunk = Math.max(1, Math.floor(budget / src.frameBytes));
+
+  await waitForFrames(src, start + perChunk);
+
+  if (src.error && src.frames.length <= start) throw src.error;
+
+  const end = Math.max(start, Math.min(src.frames.length, start + perChunk));
+  const finished = src.done && end >= src.frames.length;
+
+  return {
+    success: true,
+    postId: post.id,
+    start,
+    count: end - start,
+    nextIndex: end,
+    done: finished,
+    total: finished ? src.frames.length : src.expected,
+    width: src.width,
+    height: src.height,
+    fps: src.fps,
+    delay: src.delay,
+    duration: src.duration,
+    originalWidth: src.srcWidth,
+    originalHeight: src.srcHeight,
+    frames: src.frames.slice(start, end).map((f) => f.toString("base64")),
+  };
+}
+
+const THUMB_MAX_DIMENSION = 150;
+const THUMB_CHUNK_MAX = 24;
+const THUMB_CONCURRENCY = 6;
+
 let thumbActive = 0;
 const thumbWaiters = [];
 async function withThumbSlot(fn) {
@@ -531,9 +777,7 @@ async function withThumbSlot(fn) {
   }
 }
 
-/** Grid thumbnail for one cached post: raw RGBA, longest side <= 150px. */
 async function buildGridThumb(post, index) {
-  // e621's preview is already <=150px; fall back to the sample if it is missing.
   const url = isSupportedUrl(post.previewUrl)
     ? post.previewUrl
     : isSupportedUrl(post.sampleUrl)
@@ -560,19 +804,16 @@ async function buildGridThumb(post, index) {
   return {
     success: true,
     mode: "thumb",
-    index: index + 1, // client uses this as LayoutOrder
+    index: index + 1,
     postId: post.id,
     width: info.width,
     height: info.height,
-    // size of the sample the post view will lay out with (client scales to 850)
     originalWidth: post.width || info.width,
     originalHeight: post.height || info.height,
     pixelData: data.toString("base64"),
     meta: post.meta,
   };
 }
-
-// --- routes ----------------------------------------------------------------
 
 app.get("/", (req, res) => {
   res.json({
@@ -581,6 +822,7 @@ app.get("/", (req, res) => {
     sessions: sessions.size,
     fullCache: fullCache.size,
     gifCache: gifCache.size,
+    videoCache: videoCache.size,
   });
 });
 
@@ -607,12 +849,12 @@ app.post("/fetch-posts", async (req, res) => {
 
     const slim = posts
       .map(slimPost)
-      .filter((p) => isSupportedUrl(p.sampleUrl) || isSupportedUrl(p.fileUrl));
+      .filter((p) => isSupportedUrl(p.sampleUrl) || isSupportedUrl(p.fileUrl) || p.video);
 
     const session = getSession(sessionId);
     session.posts = slim;
     session.cursor = 0;
-    session.tags = finalTags; // used by /artist-posts to keep the player's rating: filters
+    session.tags = finalTags;
 
     res.json({
       success: true,
@@ -625,14 +867,9 @@ app.post("/fetch-posts", async (req, res) => {
   }
 });
 
-/**
- * Body: { sessionId }
- * Total number of posts matching the session's current search, so the client can show page numbers.
- * Uses e621's /counts/posts.json; if that fails the client simply shows prev/next without a last page.
- */
 const COUNT_TTL_MS = 5 * 60 * 1000;
 const COUNT_CACHE_MAX = 100;
-const countCache = new Map(); // tags -> { at, total }
+const countCache = new Map();
 
 app.post("/post-count", async (req, res) => {
   const { sessionId } = req.body || {};
@@ -662,10 +899,6 @@ app.post("/post-count", async (req, res) => {
   }
 });
 
-/**
- * Body: { sessionId, start, count }
- * Returns grid thumbnails for session.posts[start .. start+count-1].
- */
 app.post("/get-thumbs", async (req, res) => {
   const { sessionId, start = 0, count = 12 } = req.body || {};
 
@@ -723,7 +956,6 @@ app.post("/get-next-image", async (req, res) => {
   }
 });
 
-/** Fetch one specific post from the session cache (used for "Original" in the post view). */
 app.post("/get-image", async (req, res) => {
   const { postId, mode = "sample", sessionId } = req.body || {};
 
@@ -746,10 +978,6 @@ app.post("/get-image", async (req, res) => {
   }
 });
 
-/**
- * One 1024px tile of a post's full-resolution original.
- * Body: { sessionId, postId, tx, ty }  (tx = column, ty = row, both 0-based)
- */
 app.post("/get-tile", async (req, res) => {
   const { postId, tx, ty, sessionId } = req.body || {};
 
@@ -776,10 +1004,6 @@ app.post("/get-tile", async (req, res) => {
   }
 });
 
-/**
- * Animation frames of a GIF post, served in chunks.
- * Body: { sessionId, postId, start }  (start = index of the first frame wanted)
- */
 app.post("/get-gif-frames", async (req, res) => {
   const { postId, start, sessionId } = req.body || {};
 
@@ -805,13 +1029,36 @@ app.post("/get-gif-frames", async (req, res) => {
   }
 });
 
-// --- "From the Artist" thumbnails -------------------------------------------
+app.post("/get-video-frames", async (req, res) => {
+  const { postId, start, sessionId } = req.body || {};
+
+  if (!validSessionId(sessionId)) {
+    return res.json({ success: false, message: "sessionId required" });
+  }
+  const from = Number.isInteger(start) ? start : parseInt(start, 10);
+  if (!Number.isInteger(from) || from < 0) {
+    return res.json({ success: false, message: "start required", postId });
+  }
+
+  const session = getSession(sessionId);
+  const post = findPost(session, postId);
+  if (!post) {
+    return res.json({ success: false, message: "Post not found in cache", postId });
+  }
+
+  try {
+    res.json(await buildVideoFrames(sessionId, post, from));
+  } catch (err) {
+    console.error("get-video-frames failed:", err.message, "post:", post.id, "start:", from);
+    res.json({ success: false, message: "Failed to process video", postId: post.id, start: from });
+  }
+});
+
 const ARTIST_DEFAULT_LIMIT = 6;
 const ARTIST_MAX_LIMIT = 12;
 const ARTIST_TTL_MS = 3 * 60 * 1000;
 const ARTIST_CACHE_MAX = 20;
 
-// artist-category tags on e621 that are not real artists
 const NON_ARTIST_TAGS = new Set([
   "conditional_dnp",
   "unknown_artist",
@@ -824,9 +1071,8 @@ const NON_ARTIST_TAGS = new Set([
   "editor_notes",
 ]);
 
-const artistCache = new Map(); // key -> { at, posts }
+const artistCache = new Map();
 
-/** Download one e621 preview (<=150px) and turn it into the same RGBA payload the Roblox client decodes. */
 async function buildThumb(p) {
   const url = p.preview && p.preview.url;
   if (!isSupportedUrl(url)) return null;
@@ -858,13 +1104,6 @@ async function buildThumb(p) {
   };
 }
 
-/**
- * Posts for the "From the Artist" panel, the way the e621 website does it:
- * ids come from e621's own recommender (/posts/:id/similar/artist.json), then the
- * posts are loaded with tags=id:1,2,3 and kept in the recommender's order, skipping
- * deleted ones. If that endpoint fails or returns nothing, fall back to a plain
- * artist-tag search (newest first).
- */
 async function similarArtistPosts(postId, limit, ratingTokens, artist) {
   try {
     const sim = await e621Get(`/posts/${postId}/similar/artist.json`, { limit });
@@ -880,7 +1119,7 @@ async function similarArtistPosts(postId, limit, ratingTokens, artist) {
       const byId = new Map((Array.isArray(data.posts) ? data.posts : []).map((p) => [p.id, p]));
       const ordered = ids
         .map((id) => byId.get(id))
-        .filter((p) => p && !(p.flags && p.flags.deleted)); // keep e621's order, skip deleted
+        .filter((p) => p && !(p.flags && p.flags.deleted));
       if (ordered.length) return ordered;
     }
   } catch (err) {
@@ -894,12 +1133,6 @@ async function similarArtistPosts(postId, limit, ratingTokens, artist) {
   return Array.isArray(data.posts) ? data.posts : [];
 }
 
-/**
- * Other posts by the open post's artist.
- * Body: { sessionId, postId, limit? }
- * Keeps any rating: filters from the player's own search so the panel never
- * shows a rating they filtered out.
- */
 app.post("/artist-posts", async (req, res) => {
   const { postId, sessionId, limit = ARTIST_DEFAULT_LIMIT } = req.body || {};
 
@@ -927,19 +1160,17 @@ app.post("/artist-posts", async (req, res) => {
   const query = [artist, ...ratingTokens].join(" ");
 
   try {
-    // results depend on the open post (recommender), so the post id is part of the key
     const cacheKey = `${post.id}|${query}|${cleanLimit}`;
     let list;
     const hit = artistCache.get(cacheKey);
     if (hit && Date.now() - hit.at < ARTIST_TTL_MS) {
       list = hit.posts;
     } else {
-      // ask for one extra so we can drop the post that is currently open
       const raw = await similarArtistPosts(post.id, cleanLimit + 1, ratingTokens, artist);
       const built = await Promise.all(
         raw.map(async (p) => {
           const slim = slimPost(p);
-          if (!isSupportedUrl(slim.sampleUrl) && !isSupportedUrl(slim.fileUrl)) return null;
+          if (!isSupportedUrl(slim.sampleUrl) && !isSupportedUrl(slim.fileUrl) && !slim.video) return null;
           const thumb = await buildThumb(p).catch(() => null);
           return thumb ? { thumb, slim } : null;
         })
@@ -952,7 +1183,6 @@ app.post("/artist-posts", async (req, res) => {
 
     const entries = list.filter((e) => String(e.slim.id) !== String(post.id)).slice(0, cleanLimit);
 
-    // register them in the session so /get-image, /get-tile and /artist-posts work when one is opened
     for (const e of entries) {
       const key = String(e.slim.id);
       session.extra.delete(key);
@@ -967,10 +1197,9 @@ app.post("/artist-posts", async (req, res) => {
   }
 });
 
-// Tag autocomplete, with a short in-memory cache so typing doesn't hammer e621.
 const AC_TTL_MS = 60 * 1000;
 const AC_MAX_ENTRIES = 300;
-const acCache = new Map(); // query -> { at, suggestions }
+const acCache = new Map();
 
 app.post("/autocomplete-tags", async (req, res) => {
   const { query = "" } = req.body || {};
